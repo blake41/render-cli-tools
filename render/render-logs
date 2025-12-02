@@ -1,0 +1,102 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/render-common.sh"
+
+# Defaults
+LINES=20
+LOG_TYPE=""
+LOG_LEVEL=""
+SINCE=""
+
+# Parse arguments
+SERVICE_ID=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --lines|-n)
+            LINES="$2"
+            shift 2
+            ;;
+        --type)
+            LOG_TYPE="$2"
+            shift 2
+            ;;
+        --level)
+            LOG_LEVEL="$2"
+            shift 2
+            ;;
+        --since)
+            SINCE="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: render-logs <service-id> [options]"
+            echo ""
+            echo "Options:"
+            echo "  --lines, -n N    Number of log lines (default: 20)"
+            echo "  --type TYPE      Filter by type: app, request, build"
+            echo "  --level LEVEL    Filter by level: error, warn, info"
+            echo "  --since TIME     Start time (RFC3339 or relative like '1h' or '30m')"
+            echo ""
+            echo "Examples:"
+            echo "  render-logs srv-xxxxx"
+            echo "  render-logs srv-xxxxx --level error --lines 50"
+            echo "  render-logs srv-xxxxx --since 1h"
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            SERVICE_ID="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$SERVICE_ID" ]]; then
+    echo "Usage: render-logs <service-id> [options]" >&2
+    echo "Run with --help for more info" >&2
+    exit 1
+fi
+
+load_api_key || exit 1
+
+OWNER_ID=$(load_workspace)
+if [[ -z "$OWNER_ID" ]]; then
+    echo "Error: No workspace selected." >&2
+    echo "Run: render-workspace select <owner-id>" >&2
+    exit 1
+fi
+
+# Build query params
+PARAMS="ownerId=$OWNER_ID&resource=$SERVICE_ID&limit=$LINES&direction=backward"
+
+if [[ -n "$LOG_TYPE" ]]; then
+    PARAMS="$PARAMS&type=$LOG_TYPE"
+fi
+
+if [[ -n "$LOG_LEVEL" ]]; then
+    PARAMS="$PARAMS&level=$LOG_LEVEL"
+fi
+
+if [[ -n "$SINCE" ]]; then
+    # Convert relative time to RFC3339 if needed
+    if [[ "$SINCE" =~ ^[0-9]{4}- ]]; then
+        START_TIME="$SINCE"
+    else
+        START_TIME=$(date -u -v-"$SINCE" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+        if [[ -z "$START_TIME" ]]; then
+            echo "Could not parse time: $SINCE" >&2
+            echo "Use RFC3339 format or relative time like '1h' or '30m'" >&2
+            exit 1
+        fi
+    fi
+    PARAMS="$PARAMS&startTime=$START_TIME"
+fi
+
+# Fetch and format logs
+render_api "/logs?$PARAMS" | \
+    jq -r '.logs[]? | "\(.timestamp | split(".")[0])Z [\(.labels[] | select(.name=="level") | .value)] \(.message)"' 2>/dev/null || \
+    render_api "/logs?$PARAMS" | jq '.'

@@ -1,0 +1,45 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/render-common.sh"
+
+cmd_list() {
+    load_api_key || exit 1
+    local owner_id
+    owner_id=$(load_workspace) || true
+    
+    local url="/services?limit=50"
+    if [[ -n "$owner_id" ]]; then
+        url="$url&ownerId=$owner_id"
+    fi
+    
+    echo "Services:"
+    echo "========="
+    render_api "$url" | jq -r '.[] | .service | "\(.id)\t\(.name)\t\(.type)\t\(.serviceDetails.url // "n/a")"' | column -t -s $'\t'
+}
+
+cmd_get() {
+    load_api_key || exit 1
+    local service_id="${1:-}"
+    if [[ -z "$service_id" ]]; then
+        echo "Usage: render-services get <service-id>" >&2
+        exit 1
+    fi
+    render_api "/services/$service_id" | jq '.'
+}
+
+case "${1:-help}" in
+    list)
+        cmd_list
+        ;;
+    get)
+        cmd_get "${2:-}"
+        ;;
+    *)
+        echo "Usage: render-services <command> [args]"
+        echo ""
+        echo "Commands:"
+        echo "  list              List all services"
+        echo "  get <id>          Get service details"
+        ;;
+esac

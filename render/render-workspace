@@ -1,0 +1,73 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/render-common.sh"
+
+cmd_list() {
+    load_api_key || exit 1
+    echo "Workspaces:"
+    echo "==========="
+    render_api "/owners" | jq -r '.[] | "\(.owner.id)\t\(.owner.name)\t\(.owner.type)"' | column -t -s $'\t'
+}
+
+cmd_select() {
+    local owner_id="${1:-}"
+    if [[ -z "$owner_id" ]]; then
+        echo "Usage: render-workspace select <owner-id>" >&2
+        exit 1
+    fi
+    
+    # Save to global config
+    echo "$owner_id" > "$CONFIG_DIR/workspace"
+    echo "Selected workspace: $owner_id (saved to ~/.config/render/workspace)"
+}
+
+cmd_select_local() {
+    local owner_id="${1:-}"
+    if [[ -z "$owner_id" ]]; then
+        echo "Usage: render-workspace select-local <owner-id>" >&2
+        exit 1
+    fi
+    
+    # Save to local directory
+    echo "$owner_id" > ".render-workspace"
+    echo "Selected workspace: $owner_id (saved to .render-workspace)"
+}
+
+cmd_current() {
+    local ws
+    ws=$(load_workspace)
+    if [[ -n "$ws" ]]; then
+        echo "$ws"
+    else
+        echo "No workspace selected." >&2
+        echo "Run: render-workspace select <owner-id>" >&2
+        exit 1
+    fi
+}
+
+case "${1:-help}" in
+    list)
+        cmd_list
+        ;;
+    select)
+        cmd_select "${2:-}"
+        ;;
+    select-local)
+        cmd_select_local "${2:-}"
+        ;;
+    current)
+        cmd_current
+        ;;
+    *)
+        echo "Usage: render-workspace <command> [args]"
+        echo ""
+        echo "Commands:"
+        echo "  list                  List all workspaces"
+        echo "  select <id>           Set global default workspace"
+        echo "  select-local <id>     Set workspace for current project"
+        echo "  current               Show current workspace"
+        echo ""
+        echo "Config resolution: .env > .render-workspace > ~/.config/render/workspace"
+        ;;
+esac
