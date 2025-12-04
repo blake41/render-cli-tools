@@ -1,0 +1,113 @@
+#!/bin/bash
+set -eo pipefail
+
+source "$(dirname "$0")/cf-common.sh"
+
+# Defaults
+FORMAT="pretty"
+SAMPLING_RATE=""
+FILTER=""
+ONCE=false
+
+show_help() {
+    echo "Usage: cf-logs <worker-name> [options]"
+    echo ""
+    echo "Stream real-time logs from a Cloudflare Worker using wrangler tail."
+    echo ""
+    echo "Options:"
+    echo "  --format FORMAT    Output format: pretty, json (default: pretty)"
+    echo "  --sampling RATE    Sampling rate 0-1 (default: 1)"
+    echo "  --status CODE      Filter by HTTP status (e.g., 500)"
+    echo "  --search TEXT      Filter by text in log message"
+    echo "  --once             Exit after first log (useful for testing)"
+    echo "  --ip IP            Filter by client IP"
+    echo ""
+    echo "Examples:"
+    echo "  cf-logs summarizer"
+    echo "  cf-logs summarizer --format json"
+    echo "  cf-logs summarizer --status 500"
+    echo "  cf-logs summarizer --search error"
+    echo ""
+    echo "Note: This streams real-time logs. Press Ctrl+C to stop."
+    echo "For historical logs, Cloudflare requires Logpush (paid feature)."
+    exit 0
+}
+
+# Parse arguments
+WORKER_NAME=""
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --format)
+            FORMAT="$2"
+            shift 2
+            ;;
+        --sampling)
+            SAMPLING_RATE="$2"
+            shift 2
+            ;;
+        --status)
+            EXTRA_ARGS+=("--status" "$2")
+            shift 2
+            ;;
+        --search)
+            EXTRA_ARGS+=("--search" "$2")
+            shift 2
+            ;;
+        --ip)
+            EXTRA_ARGS+=("--ip" "$2")
+            shift 2
+            ;;
+        --once)
+            ONCE=true
+            shift
+            ;;
+        --help|-h)
+            show_help
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            WORKER_NAME="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$WORKER_NAME" ]]; then
+    echo "Usage: cf-logs <worker-name> [options]" >&2
+    echo "Run with --help for more info" >&2
+    exit 1
+fi
+
+# Check if wrangler is available
+if ! command -v wrangler &>/dev/null; then
+    echo "Error: wrangler not found. Install with: npm install -g wrangler" >&2
+    exit 1
+fi
+
+# Build wrangler tail command
+CMD=(wrangler tail "$WORKER_NAME" --format "$FORMAT")
+
+if [[ -n "$SAMPLING_RATE" ]]; then
+    CMD+=(--sampling-rate "$SAMPLING_RATE")
+fi
+
+CMD+=("${EXTRA_ARGS[@]}")
+
+echo "Starting log stream for '$WORKER_NAME'..."
+echo "Press Ctrl+C to stop."
+echo ""
+
+if [[ "$ONCE" == true ]]; then
+    # Run briefly for testing (macOS compatible)
+    "${CMD[@]}" &
+    PID=$!
+    sleep 10
+    kill $PID 2>/dev/null || true
+else
+    "${CMD[@]}"
+fi

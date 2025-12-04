@@ -1,0 +1,474 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/gh-common.sh"
+
+# ============================================================================
+# RUNS command - List workflow runs
+# ============================================================================
+cmd_runs() {
+    local status="" branch="" workflow="" limit=10 json_output=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status|-s)
+                status="$2"
+                shift 2
+                ;;
+            --branch|-b)
+                branch="$2"
+                shift 2
+                ;;
+            --workflow|-w)
+                workflow="$2"
+                shift 2
+                ;;
+            --limit|-n)
+                limit="$2"
+                shift 2
+                ;;
+            --json)
+                json_output=true
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: gh-actions runs [options]"
+                echo ""
+                echo "List recent workflow runs for the current repository."
+                echo ""
+                echo "Options:"
+                echo "  --status, -s STATUS   Filter by status: success, failure, cancelled, in_progress"
+                echo "  --branch, -b BRANCH   Filter by branch"
+                echo "  --workflow, -w NAME   Filter by workflow name or file"
+                echo "  --limit, -n N         Number of runs to show (default: 10)"
+                echo "  --json                Output raw JSON"
+                echo ""
+                echo "Examples:"
+                echo "  gh-actions runs"
+                echo "  gh-actions runs --status failure"
+                echo "  gh-actions runs --branch main --limit 20"
+                echo "  gh-actions runs --workflow ci.yml"
+                return 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+        esac
+    done
+    
+    local repo
+    repo=$(get_repo) || return 1
+    
+    # Build query params
+    local params="per_page=$limit"
+    [[ -n "$status" ]] && params="$params&status=$status"
+    [[ -n "$branch" ]] && params="$params&branch=$branch"
+    
+    local response
+    if [[ -n "$workflow" ]]; then
+        response=$(gh_api "/repos/$repo/actions/workflows/$workflow/runs?$params")
+    else
+        response=$(gh_api "/repos/$repo/actions/runs?$params")
+    fi
+    
+    if [[ "$json_output" == true ]]; then
+        echo "$response" | jq '.'
+        return 0
+    fi
+    
+    # Format output
+    echo "$response" | jq -r '
+        .workflow_runs[] | 
+        [.id, .status, .conclusion // "", .name, .head_branch, .created_at, .run_started_at // "", .updated_at // ""] | 
+        @tsv
+    ' | while IFS=$'\t' read -r id status conclusion name branch created started updated; do
+        local status_fmt=$(format_status "$status" "$conclusion")
+        local time_fmt=$(relative_time "$created")
+        local duration=""
+        if [[ -n "$started" && "$started" != "null" ]]; then
+            duration=" ($(format_duration "$started" "$updated"))"
+        fi
+        printf "%s  %-10s  %-30s  %-20s  %s%s\n" "$id" "$status_fmt" "$name" "$branch" "$time_fmt" "$duration"
+    done
+}
+
+# ============================================================================
+# LOGS command - Get logs for a workflow run
+# ============================================================================
+cmd_logs() {
+    local run_id="" failed_only=false job_filter="" raw=false tail_lines=200
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --failed|-f)
+                failed_only=true
+                shift
+                ;;
+            --job|-j)
+                job_filter="$2"
+                shift 2
+                ;;
+            --raw|-r)
+                raw=true
+                shift
+                ;;
+            --tail|-t)
+                tail_lines="$2"
+                shift 2
+                ;;
+            --full)
+                tail_lines=0
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: gh-actions logs <run-id> [options]"
+                echo ""
+                echo "Get logs for a workflow run."
+                echo ""
+                echo "Options:"
+                echo "  --failed, -f        Only show failed jobs"
+                echo "  --job, -j NAME      Filter by job name (substring match)"
+                echo "  --raw, -r           Output raw log content without formatting"
+                echo "  --tail, -t N        Show last N lines per job (default: 200)"
+                echo "  --full              Show full logs (no truncation)"
+                echo ""
+                echo "Examples:"
+                echo "  gh-actions logs 12345678901"
+                echo "  gh-actions logs 12345678901 --failed"
+                echo "  gh-actions logs 12345678901 --job 'build'"
+                echo "  gh-actions logs 12345678901 --full > build.log"
+                return 0
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+            *)
+                if [[ -z "$run_id" ]]; then
+                    run_id="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    if [[ -z "$run_id" ]]; then
+        echo "Usage: gh-actions logs <run-id> [options]" >&2
+        echo "Run 'gh-actions logs --help' for more info" >&2
+        return 1
+    fi
+    
+    local repo
+    repo=$(get_repo) || return 1
+    
+    # Get jobs for this run
+    local jobs_response
+    jobs_response=$(gh_api "/repos/$repo/actions/runs/$run_id/jobs")
+    
+    # Download logs to temp directory
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    trap "rm -rf $temp_dir" EXIT
+    
+    # Download and extract logs
+    gh api "/repos/$repo/actions/runs/$run_id/logs" > "$temp_dir/logs.zip" 2>/dev/null || {
+        echo "Error: Could not download logs for run $run_id" >&2
+        echo "The run may still be in progress or logs may have expired." >&2
+        return 1
+    }
+    
+    unzip -q "$temp_dir/logs.zip" -d "$temp_dir/extracted" 2>/dev/null || {
+        echo "Error: Could not extract logs" >&2
+        return 1
+    }
+    
+    # Get job index mapping (GitHub names logs as 0_jobname.txt, 1_jobname.txt, etc.)
+    local job_index=0
+    
+    # Process each job
+    echo "$jobs_response" | jq -r '.jobs[] | [.id, .name, .status, .conclusion // "", .started_at // "", .completed_at // ""] | @tsv' | \
+    while IFS=$'\t' read -r job_id job_name job_status job_conclusion job_started job_completed; do
+        # Apply job filter
+        if [[ -n "$job_filter" && ! "$job_name" =~ $job_filter ]]; then
+            ((job_index++)) || true
+            continue
+        fi
+        
+        # Skip successful jobs if --failed
+        if [[ "$failed_only" == true && "$job_conclusion" == "success" ]]; then
+            ((job_index++)) || true
+            continue
+        fi
+        
+        local job_status_fmt=$(format_status "$job_status" "$job_conclusion")
+        local job_duration=""
+        if [[ -n "$job_started" && "$job_started" != "null" && -n "$job_completed" && "$job_completed" != "null" ]]; then
+            job_duration=" ($(format_duration "$job_started" "$job_completed"))"
+        fi
+        
+        echo ""
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${BLUE}Job: $job_name${NC}  $job_status_fmt$job_duration"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        
+        # Find log file for this job
+        # GitHub uses format: {index}_{jobname}.txt at the root level
+        local log_file=""
+        local safe_job_name=$(echo "$job_name" | tr '/' '-' | tr ' ' '-')
+        
+        # Try exact match first
+        log_file=$(find "$temp_dir/extracted" -maxdepth 1 -name "${job_index}_*.txt" 2>/dev/null | head -1)
+        
+        # Fallback: try matching by job name
+        if [[ -z "$log_file" || ! -f "$log_file" ]]; then
+            log_file=$(find "$temp_dir/extracted" -maxdepth 1 -name "*_${safe_job_name}.txt" -o -name "*_${job_name}.txt" 2>/dev/null | head -1)
+        fi
+        
+        # Last resort: just grab any .txt file that isn't system.txt
+        if [[ -z "$log_file" || ! -f "$log_file" ]]; then
+            log_file=$(find "$temp_dir/extracted" -maxdepth 1 -name "*.txt" ! -name "system.txt" 2>/dev/null | sed -n "$((job_index + 1))p")
+        fi
+        
+        if [[ -n "$log_file" && -f "$log_file" ]]; then
+            echo ""
+            if [[ "$raw" == true ]]; then
+                if [[ $tail_lines -gt 0 ]]; then
+                    tail -n "$tail_lines" "$log_file"
+                else
+                    cat "$log_file"
+                fi
+            else
+                # Format: clean timestamps, highlight groups, add color for errors
+                local content
+                if [[ $tail_lines -gt 0 ]]; then
+                    content=$(tail -n "$tail_lines" "$log_file")
+                else
+                    content=$(cat "$log_file")
+                fi
+                
+                echo "$content" | \
+                sed 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9:\.Z]* //g' | \
+                sed "s/^##\[group\]/\\${BLUE}▶ /g" | \
+                sed "s/^##\[endgroup\]/\\${NC}/g" | \
+                sed "s/^##\[error\]/\\${RED}ERROR: /g" | \
+                sed "s/^##\[warning\]/\\${YELLOW}WARN: /g" | \
+                sed '/^##\[/d' | \
+                sed "s/\(Error:\|error:\|ERROR\|FAILED\|Failed\)/${RED}\1${NC}/g" | \
+                sed "s/\(Warning:\|warning:\|WARN\)/${YELLOW}\1${NC}/g"
+            fi
+        else
+            echo -e "  ${GRAY}(no logs found for this job)${NC}"
+        fi
+        
+        ((job_index++)) || true
+    done
+}
+
+# ============================================================================
+# FAILURES command - Quick view of recent failures
+# ============================================================================
+cmd_failures() {
+    local limit=5 since="" workflow=""
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --limit|-n)
+                limit="$2"
+                shift 2
+                ;;
+            --since|-s)
+                since="$2"
+                shift 2
+                ;;
+            --workflow|-w)
+                workflow="$2"
+                shift 2
+                ;;
+            --help|-h)
+                echo "Usage: gh-actions failures [options]"
+                echo ""
+                echo "Show recent failed workflow runs with error summaries."
+                echo ""
+                echo "Options:"
+                echo "  --limit, -n N         Number of failures to show (default: 5)"
+                echo "  --since, -s TIME      Only show failures since TIME (e.g., '7d', '24h')"
+                echo "  --workflow, -w NAME   Filter by workflow name"
+                echo ""
+                echo "Examples:"
+                echo "  gh-actions failures"
+                echo "  gh-actions failures --limit 10"
+                echo "  gh-actions failures --since 7d"
+                return 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+        esac
+    done
+    
+    local repo
+    repo=$(get_repo) || return 1
+    
+    # Build query - get more than needed, filter by date client-side if needed
+    local params="per_page=$((limit * 3))&status=completed"
+    
+    local response
+    if [[ -n "$workflow" ]]; then
+        response=$(gh_api "/repos/$repo/actions/workflows/$workflow/runs?$params")
+    else
+        response=$(gh_api "/repos/$repo/actions/runs?$params")
+    fi
+    
+    # Filter to failures only and apply since filter
+    local now=$(date +%s)
+    local since_ts=0
+    if [[ -n "$since" ]]; then
+        if [[ "$since" =~ ^([0-9]+)d$ ]]; then
+            since_ts=$((now - ${BASH_REMATCH[1]} * 86400))
+        elif [[ "$since" =~ ^([0-9]+)h$ ]]; then
+            since_ts=$((now - ${BASH_REMATCH[1]} * 3600))
+        fi
+    fi
+    
+    local count=0
+    echo "$response" | jq -r '
+        .workflow_runs[] | select(.conclusion == "failure") |
+        [.id, .name, .head_branch, .created_at, .html_url] | @tsv
+    ' | while IFS=$'\t' read -r run_id name branch created url; do
+        # Apply since filter
+        if [[ $since_ts -gt 0 ]]; then
+            local created_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$created" +%s 2>/dev/null || date -d "$created" +%s 2>/dev/null)
+            if [[ $created_ts -lt $since_ts ]]; then
+                continue
+            fi
+        fi
+        
+        ((count++)) || true
+        if [[ $count -gt $limit ]]; then
+            break
+        fi
+        
+        local time_fmt=$(relative_time "$created")
+        
+        echo ""
+        echo -e "${RED}✗ FAILED${NC}: $name"
+        echo -e "  ${GRAY}Branch:${NC} $branch"
+        echo -e "  ${GRAY}Time:${NC}   $time_fmt"
+        echo -e "  ${GRAY}Run ID:${NC} $run_id"
+        echo -e "  ${GRAY}URL:${NC}    $url"
+        
+        # Get failed jobs for this run
+        local jobs_response
+        jobs_response=$(gh_api "/repos/$repo/actions/runs/$run_id/jobs")
+        
+        echo -e "  ${GRAY}Failed steps:${NC}"
+        echo "$jobs_response" | jq -r '
+            .jobs[] | select(.conclusion == "failure") |
+            .steps[]? | select(.conclusion == "failure") |
+            "    - \(.name)"
+        '
+    done
+    
+    if [[ $count -eq 0 ]]; then
+        echo -e "${GREEN}No failures found!${NC}"
+    fi
+}
+
+# ============================================================================
+# RERUN command - Re-run a workflow
+# ============================================================================
+cmd_rerun() {
+    local run_id="" failed_only=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --failed|-f)
+                failed_only=true
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: gh-actions rerun <run-id> [options]"
+                echo ""
+                echo "Re-run a workflow."
+                echo ""
+                echo "Options:"
+                echo "  --failed, -f    Only re-run failed jobs"
+                echo ""
+                echo "Examples:"
+                echo "  gh-actions rerun 12345678901"
+                echo "  gh-actions rerun 12345678901 --failed"
+                return 0
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+            *)
+                if [[ -z "$run_id" ]]; then
+                    run_id="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    if [[ -z "$run_id" ]]; then
+        echo "Usage: gh-actions rerun <run-id> [--failed]" >&2
+        return 1
+    fi
+    
+    local repo
+    repo=$(get_repo) || return 1
+    
+    local endpoint="/repos/$repo/actions/runs/$run_id/rerun"
+    if [[ "$failed_only" == true ]]; then
+        endpoint="/repos/$repo/actions/runs/$run_id/rerun-failed-jobs"
+    fi
+    
+    gh_api "$endpoint" -X POST >/dev/null && \
+        echo -e "${GREEN}✓${NC} Re-run triggered for run $run_id" || \
+        echo -e "${RED}✗${NC} Failed to trigger re-run"
+}
+
+# ============================================================================
+# Main dispatch
+# ============================================================================
+case "${1:-help}" in
+    runs|run|r)
+        shift
+        cmd_runs "$@"
+        ;;
+    logs|log|l)
+        shift
+        cmd_logs "$@"
+        ;;
+    failures|fail|f)
+        shift
+        cmd_failures "$@"
+        ;;
+    rerun)
+        shift
+        cmd_rerun "$@"
+        ;;
+    help|--help|-h)
+        echo "Usage: gh-actions <command> [options]"
+        echo ""
+        echo "GitHub Actions CLI for the current repository."
+        echo ""
+        echo "Commands:"
+        echo "  runs      List recent workflow runs"
+        echo "  logs      Get logs for a workflow run"
+        echo "  failures  Show recent failures with error summaries"
+        echo "  rerun     Re-run a workflow"
+        echo ""
+        echo "Run 'gh-actions <command> --help' for more info on a command."
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        echo "Run 'gh-actions --help' for usage" >&2
+        exit 1
+        ;;
+esac
+

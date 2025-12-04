@@ -1,0 +1,679 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/infisical-api-common.sh"
+
+# ============================================================================
+# SETUP COMMANDS
+# ============================================================================
+
+cmd_setup() {
+    ensure_config_dir
+    
+    echo "Infisical CLI Setup"
+    echo "==================="
+    echo ""
+    echo "You need a Machine Identity with Universal Auth."
+    echo "Create one in Infisical: Access Control > Machine Identities"
+    echo ""
+    
+    read -p "Client ID: " client_id
+    read -sp "Client Secret: " client_secret
+    echo ""
+    
+    # Optional: API host for self-hosted
+    read -p "API Host [https://us.infisical.com]: " api_host
+    api_host="${api_host:-https://us.infisical.com}"
+    
+    # Save credentials
+    cat > "$CONFIG_DIR/credentials" << EOF
+INFISICAL_CLIENT_ID="$client_id"
+INFISICAL_CLIENT_SECRET="$client_secret"
+EOF
+    chmod 600 "$CONFIG_DIR/credentials"
+    
+    # Save API host if not default
+    if [[ "$api_host" != "https://us.infisical.com" ]]; then
+        echo "$api_host" > "$CONFIG_DIR/api_host"
+    fi
+    
+    echo -e "${GREEN}Credentials saved to ~/.config/infisical/${NC}"
+    
+    # Test authentication
+    echo ""
+    echo "Testing authentication..."
+    load_credentials || exit 1
+    if get_access_token > /dev/null 2>&1; then
+        echo -e "${GREEN}✓ Authentication successful!${NC}"
+    else
+        echo -e "${RED}✗ Authentication failed. Check your credentials.${NC}"
+        exit 1
+    fi
+}
+
+# ============================================================================
+# PROJECT COMMANDS
+# ============================================================================
+
+cmd_projects_list() {
+    load_credentials || exit 1
+    
+    echo "Projects:"
+    echo "========="
+    infisical_api "/v2/organizations/projects" | jq -r '.projects[] | "\(.id)\t\(.name)\t\(.environments | length) envs"' | column -t -s $'\t'
+}
+
+cmd_projects_get() {
+    local project_id="${1:-}"
+    if [[ -z "$project_id" ]]; then
+        echo "Usage: infisical projects get <project-id>" >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    infisical_api "/v2/workspace/$project_id" | pretty_json '.'
+}
+
+# ============================================================================
+# SECRETS COMMANDS
+# ============================================================================
+
+cmd_secrets_list() {
+    local project_id=""
+    local environment="prod"
+    local path="/"
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project)
+                project_id="$2"
+                shift 2
+                ;;
+            -e|--env)
+                environment="$2"
+                shift 2
+                ;;
+            --path)
+                path="$2"
+                shift 2
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+    
+    if [[ -z "$project_id" ]]; then
+        echo "Usage: infisical secrets list -p <project-id> [-e <environment>] [--path <path>]" >&2
+        echo "" >&2
+        echo "Options:" >&2
+        echo "  -p, --project  Project ID (required)" >&2
+        echo "  -e, --env      Environment slug (default: prod)" >&2
+        echo "  --path         Secret path (default: /)" >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    
+    echo "Secrets in $project_id / $environment / $path:"
+    echo "================================================"
+    
+    local encoded_path
+    encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
+    
+    infisical_api "/v3/secrets/raw?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path" \
+        | jq -r '.secrets[] | "\(.secretKey)\t\(.secretValue | if length > 40 then .[0:40] + "..." else . end)"' \
+        | column -t -s $'\t'
+}
+
+cmd_secrets_get() {
+    local project_id=""
+    local environment="prod"
+    local path="/"
+    local secret_key=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project)
+                project_id="$2"
+                shift 2
+                ;;
+            -e|--env)
+                environment="$2"
+                shift 2
+                ;;
+            --path)
+                path="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$secret_key" ]]; then
+                    secret_key="$1"
+                    shift
+                else
+                    echo "Unknown option: $1" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+    
+    if [[ -z "$project_id" || -z "$secret_key" ]]; then
+        echo "Usage: infisical secrets get <secret-key> -p <project-id> [-e <environment>] [--path <path>]" >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    
+    local encoded_path
+    encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
+    
+    infisical_api "/v3/secrets/raw/$secret_key?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path" \
+        | pretty_json '.'
+}
+
+cmd_secrets_export() {
+    local project_id=""
+    local environment="prod"
+    local path="/"
+    local format="env"
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project)
+                project_id="$2"
+                shift 2
+                ;;
+            -e|--env)
+                environment="$2"
+                shift 2
+                ;;
+            --path)
+                path="$2"
+                shift 2
+                ;;
+            -f|--format)
+                format="$2"
+                shift 2
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+    
+    if [[ -z "$project_id" ]]; then
+        echo "Usage: infisical secrets export -p <project-id> [-e <environment>] [--path <path>] [-f format]" >&2
+        echo "" >&2
+        echo "Formats: env (default), json" >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    
+    local encoded_path
+    encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
+    
+    local response
+    response=$(infisical_api "/v3/secrets/raw?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path")
+    
+    case "$format" in
+        env)
+            echo "$response" | jq -r '.secrets[] | "\(.secretKey)=\(.secretValue)"'
+            ;;
+        json)
+            echo "$response" | jq '.secrets | map({key: .secretKey, value: .secretValue}) | from_entries'
+            ;;
+        *)
+            echo "Unknown format: $format" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# ============================================================================
+# SYNC COMMANDS
+# ============================================================================
+
+cmd_syncs_list() {
+    local project_id="${1:-}"
+    
+    if [[ -z "$project_id" ]]; then
+        echo "Usage: infisical syncs list <project-id>" >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    
+    echo "Secret Syncs for $project_id:"
+    echo "=============================="
+    
+    # Try the secret-syncs endpoint
+    local response
+    response=$(infisical_api "/v1/secret-syncs?projectId=$project_id" 2>&1)
+    
+    if echo "$response" | jq -e '.secretSyncs' > /dev/null 2>&1; then
+        echo "$response" | jq -r '.secretSyncs[] | "\(.id)\t\(.destination)\t\(.status)\t\(.lastSyncedAt // "never")"' | column -t -s $'\t'
+    else
+        echo "$response" | pretty_json '.'
+    fi
+}
+
+cmd_syncs_get() {
+    local sync_id="${1:-}"
+    
+    if [[ -z "$sync_id" ]]; then
+        echo "Usage: infisical syncs get <sync-id>" >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    
+    # Try Render-specific endpoint first
+    infisical_api "/v1/secret-syncs/render/$sync_id" | pretty_json '.'
+}
+
+cmd_syncs_trigger() {
+    local sync_id="${1:-}"
+    
+    if [[ -z "$sync_id" ]]; then
+        echo "Usage: infisical syncs trigger <sync-id>" >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    
+    echo "Triggering sync $sync_id..."
+    infisical_api "/v1/secret-syncs/render/$sync_id/sync" -X POST | pretty_json '.'
+}
+
+cmd_syncs_remove_secrets() {
+    local sync_id="${1:-}"
+    
+    if [[ -z "$sync_id" ]]; then
+        echo "Usage: infisical syncs remove-secrets <sync-id>" >&2
+        echo "" >&2
+        echo "This will remove secrets from Render that are not in Infisical." >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    
+    echo -e "${YELLOW}WARNING: This will delete secrets from Render that are not in Infisical.${NC}"
+    read -p "Continue? [y/N] " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+    
+    echo "Removing stale secrets via sync $sync_id..."
+    infisical_api "/v1/secret-syncs/render/$sync_id/remove-secrets" -X POST | pretty_json '.'
+}
+
+# ============================================================================
+# FORCE SYNC (WORKAROUND)
+# ============================================================================
+
+cmd_syncs_force() {
+    local sync_id="${1:-}"
+    
+    if [[ -z "$sync_id" ]]; then
+        echo "Usage: infisical syncs force <sync-id>" >&2
+        echo "" >&2
+        echo "Forces a sync by adding/removing a temporary secret." >&2
+        echo "(Workaround for broken sync-secrets API)" >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    
+    # Get sync details
+    echo "Getting sync details..."
+    local sync_info
+    sync_info=$(infisical_api "/v1/secret-syncs/render/$sync_id")
+    
+    local project_id env_slug secret_path env_group_id
+    project_id=$(echo "$sync_info" | jq -r '.secretSync.projectId')
+    env_slug=$(echo "$sync_info" | jq -r '.secretSync.environment.slug')
+    secret_path=$(echo "$sync_info" | jq -r '.secretSync.folder.path')
+    env_group_id=$(echo "$sync_info" | jq -r '.secretSync.destinationConfig.environmentGroupId')
+    
+    if [[ -z "$project_id" || "$project_id" == "null" ]]; then
+        echo -e "${RED}Error: Could not get sync details${NC}" >&2
+        exit 1
+    fi
+    
+    echo "  Project: $project_id"
+    echo "  Environment: $env_slug"
+    echo "  Path: $secret_path"
+    echo "  Render Env Group: $env_group_id"
+    echo ""
+    
+    # Create trigger secret
+    local trigger_key="_INFISICAL_SYNC_TRIGGER_$(date +%s)"
+    echo "Creating temporary trigger secret: $trigger_key"
+    
+    local create_result
+    create_result=$(infisical_api "/v3/secrets/raw/$trigger_key" \
+        -X POST \
+        -d "{
+            \"workspaceId\": \"$project_id\",
+            \"environment\": \"$env_slug\",
+            \"secretPath\": \"$secret_path\",
+            \"secretValue\": \"$(date -Iseconds)\",
+            \"type\": \"shared\"
+        }")
+    
+    if ! echo "$create_result" | jq -e '.secret' > /dev/null 2>&1; then
+        echo -e "${RED}Error creating trigger secret:${NC}" >&2
+        echo "$create_result" | pretty_json '.'
+        exit 1
+    fi
+    
+    echo -e "${GREEN}✓ Trigger secret created${NC}"
+    
+    # Wait for auto-sync
+    echo ""
+    echo "Waiting for auto-sync (5 seconds)..."
+    sleep 5
+    
+    # Delete trigger secret from Infisical
+    echo "Deleting trigger secret from Infisical..."
+    infisical_api "/v3/secrets/raw/$trigger_key" \
+        -X DELETE \
+        -d "{
+            \"workspaceId\": \"$project_id\",
+            \"environment\": \"$env_slug\",
+            \"secretPath\": \"$secret_path\"
+        }" > /dev/null
+    
+    echo -e "${GREEN}✓ Trigger secret deleted from Infisical${NC}"
+    
+    # Delete trigger secret from Render (since Infisical won't auto-delete it)
+    if command -v render-envgroups &> /dev/null || [[ -f "$(dirname "$0")/../render/render-common.sh" ]]; then
+        echo "Cleaning up trigger secret from Render..."
+        
+        # Source render-common
+        if [[ -f "$(dirname "$0")/../render/render-common.sh" ]]; then
+            source "$(dirname "$0")/../render/render-common.sh"
+        else
+            source "$HOME/.local/bin/render-common.sh" 2>/dev/null || true
+        fi
+        
+        if load_api_key 2>/dev/null; then
+            sleep 2  # Wait a moment for sync to complete
+            curl -sS "https://api.render.com/v1/env-groups/$env_group_id/env-vars/$trigger_key" \
+                -X DELETE \
+                -H "Authorization: Bearer $RENDER_API_KEY" > /dev/null 2>&1 || true
+            echo -e "${GREEN}✓ Trigger secret cleaned up from Render${NC}"
+        else
+            echo -e "${YELLOW}Note: Could not clean up trigger from Render (no API key). Delete '$trigger_key' manually.${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Note: render-common.sh not found. Delete '$trigger_key' from Render manually.${NC}"
+    fi
+    
+    echo ""
+    echo -e "${GREEN}✓ Sync triggered successfully!${NC}"
+}
+
+# ============================================================================
+# DEBUG / COMPARE COMMANDS
+# ============================================================================
+
+cmd_debug_compare() {
+    local project_id=""
+    local environment="prod"
+    local path="/"
+    local render_env_group=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--project)
+                project_id="$2"
+                shift 2
+                ;;
+            -e|--env)
+                environment="$2"
+                shift 2
+                ;;
+            --path)
+                path="$2"
+                shift 2
+                ;;
+            -r|--render-group)
+                render_env_group="$2"
+                shift 2
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+    
+    if [[ -z "$project_id" || -z "$render_env_group" ]]; then
+        echo "Usage: infisical debug compare -p <project-id> -r <render-env-group-id> [-e <environment>] [--path <path>]" >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    
+    # Check if render tools are available
+    if ! command -v render-services &> /dev/null; then
+        echo -e "${RED}Error: render-services not found. Install render CLI tools first.${NC}" >&2
+        exit 1
+    fi
+    
+    echo "Comparing Infisical ($project_id/$environment$path) with Render env group ($render_env_group)"
+    echo "=========================================================================================="
+    echo ""
+    
+    # Get Infisical secrets
+    local encoded_path
+    encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
+    local infisical_secrets
+    infisical_secrets=$(infisical_api "/v3/secrets/raw?workspaceId=$project_id&environment=$environment&secretPath=$encoded_path" \
+        | jq -r '.secrets[].secretKey' | sort)
+    
+    # Get Render env vars (need to source render-common for this)
+    source "$(dirname "$0")/../render/render-common.sh" 2>/dev/null || {
+        echo -e "${RED}Error: Could not source render-common.sh${NC}" >&2
+        exit 1
+    }
+    load_api_key || exit 1
+    
+    local render_vars
+    render_vars=$(render_api "/env-groups/$render_env_group/env-vars" | jq -r '.[].key' | sort)
+    
+    echo "Keys in Infisical only (should be ADDED to Render):"
+    echo "----------------------------------------------------"
+    comm -23 <(echo "$infisical_secrets") <(echo "$render_vars") | while read key; do
+        echo -e "  ${GREEN}+ $key${NC}"
+    done
+    echo ""
+    
+    echo "Keys in Render only (should be DELETED from Render):"
+    echo "-----------------------------------------------------"
+    comm -13 <(echo "$infisical_secrets") <(echo "$render_vars") | while read key; do
+        echo -e "  ${RED}- $key${NC}"
+    done
+    echo ""
+    
+    echo "Keys in both (check values match):"
+    echo "-----------------------------------"
+    comm -12 <(echo "$infisical_secrets") <(echo "$render_vars") | while read key; do
+        echo -e "  ${BLUE}= $key${NC}"
+    done
+}
+
+# ============================================================================
+# INTEGRATIONS LIST
+# ============================================================================
+
+cmd_integrations_list() {
+    local project_id="${1:-}"
+    
+    if [[ -z "$project_id" ]]; then
+        echo "Usage: infisical integrations list <project-id>" >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    
+    echo "Integrations for $project_id:"
+    echo "=============================="
+    
+    infisical_api "/v1/integration?workspaceId=$project_id" | pretty_json '.'
+}
+
+# ============================================================================
+# RAW API CALL
+# ============================================================================
+
+cmd_api() {
+    local method="GET"
+    local endpoint=""
+    local data=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -X|--method)
+                method="$2"
+                shift 2
+                ;;
+            -d|--data)
+                data="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$endpoint" ]]; then
+                    endpoint="$1"
+                    shift
+                else
+                    echo "Unknown option: $1" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+    
+    if [[ -z "$endpoint" ]]; then
+        echo "Usage: infisical api <endpoint> [-X METHOD] [-d data]" >&2
+        echo "" >&2
+        echo "Example: infisical api /v1/secret-syncs?projectId=xxx" >&2
+        exit 1
+    fi
+    
+    load_credentials || exit 1
+    
+    if [[ -n "$data" ]]; then
+        infisical_api "$endpoint" -X "$method" -d "$data" | pretty_json '.'
+    else
+        infisical_api "$endpoint" -X "$method" | pretty_json '.'
+    fi
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+show_help() {
+    echo "Usage: infisical <command> [subcommand] [args]"
+    echo ""
+    echo "Setup:"
+    echo "  setup                       Configure credentials interactively"
+    echo ""
+    echo "Projects:"
+    echo "  projects list               List all projects"
+    echo "  projects get <id>           Get project details"
+    echo ""
+    echo "Secrets:"
+    echo "  secrets list -p <project> [-e env] [--path /path]"
+    echo "                              List secrets"
+    echo "  secrets get <key> -p <project> [-e env] [--path /path]"
+    echo "                              Get a specific secret"
+    echo "  secrets export -p <project> [-e env] [--path /path] [-f format]"
+    echo "                              Export secrets (env or json format)"
+    echo ""
+    echo "Syncs (Render):"
+    echo "  syncs list <project-id>     List secret syncs"
+    echo "  syncs get <sync-id>         Get sync details"
+    echo "  syncs trigger <sync-id>     Trigger a sync (API - may not work)"
+    echo "  syncs force <sync-id>       Force sync via temp secret (workaround)"
+    echo "  syncs remove-secrets <sync-id>"
+    echo "                              Remove stale secrets from Render"
+    echo ""
+    echo "Integrations:"
+    echo "  integrations list <project-id>"
+    echo "                              List all integrations"
+    echo ""
+    echo "Debug:"
+    echo "  debug compare -p <project> -r <render-env-group> [-e env] [--path /path]"
+    echo "                              Compare Infisical secrets with Render env group"
+    echo ""
+    echo "Raw API:"
+    echo "  api <endpoint> [-X METHOD] [-d data]"
+    echo "                              Make raw API call"
+    echo ""
+    echo "Config:"
+    echo "  Global: ~/.config/infisical/credentials"
+    echo "  Override: .env with INFISICAL_CLIENT_ID and INFISICAL_CLIENT_SECRET"
+}
+
+case "${1:-help}" in
+    setup)
+        cmd_setup
+        ;;
+    projects)
+        case "${2:-list}" in
+            list) cmd_projects_list ;;
+            get) cmd_projects_get "${3:-}" ;;
+            *) echo "Usage: infisical projects <list|get>" >&2 ;;
+        esac
+        ;;
+    secrets)
+        case "${2:-}" in
+            list) shift 2; cmd_secrets_list "$@" ;;
+            get) shift 2; cmd_secrets_get "$@" ;;
+            export) shift 2; cmd_secrets_export "$@" ;;
+            *) echo "Usage: infisical secrets <list|get|export>" >&2 ;;
+        esac
+        ;;
+    syncs)
+        case "${2:-}" in
+            list) cmd_syncs_list "${3:-}" ;;
+            get) cmd_syncs_get "${3:-}" ;;
+            trigger) cmd_syncs_trigger "${3:-}" ;;
+            force) cmd_syncs_force "${3:-}" ;;
+            remove-secrets) cmd_syncs_remove_secrets "${3:-}" ;;
+            *) echo "Usage: infisical syncs <list|get|trigger|force|remove-secrets>" >&2 ;;
+        esac
+        ;;
+    integrations)
+        case "${2:-}" in
+            list) cmd_integrations_list "${3:-}" ;;
+            *) echo "Usage: infisical integrations <list>" >&2 ;;
+        esac
+        ;;
+    debug)
+        case "${2:-}" in
+            compare) shift 2; cmd_debug_compare "$@" ;;
+            *) echo "Usage: infisical debug <compare>" >&2 ;;
+        esac
+        ;;
+    api)
+        shift; cmd_api "$@"
+        ;;
+    help|--help|-h)
+        show_help
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        show_help
+        exit 1
+        ;;
+esac
+
