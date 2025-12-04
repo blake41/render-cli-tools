@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# sf-query - Agent-safe Salesforce SOQL queries
+# SOQL is inherently read-only, no write protection needed
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Environment to org alias mapping
+declare -A ORG_ALIASES=(
+  [prod]="vscodeOrg"
+  [production]="vscodeOrg"
+  [sandbox]="MySandbox"
+  [clayuni]="MySandbox"
+)
+
+usage() {
+  cat <<EOF
+sf-query - Safe Salesforce SOQL queries for AI agents
+
+USAGE
+  sf-query <environment> "<soql-query>"
+  sf-query <environment> describe <object>
+
+ENVIRONMENTS
+  prod, production  → Clay production org
+  sandbox, clayuni  → Clay sandbox org
+
+EXAMPLES
+  # List accounts
+  sf-query prod "SELECT Id, Name, Industry FROM Account LIMIT 10"
+
+  # Find opportunities
+  sf-query prod "SELECT Id, Name, StageName, Amount FROM Opportunity WHERE IsClosed = false"
+
+  # Count records
+  sf-query sandbox "SELECT COUNT() FROM Contact"
+
+  # Describe an object's fields
+  sf-query prod describe Account
+
+  # Search across objects
+  sf-query prod "SELECT Id, Name FROM Account WHERE Name LIKE '%Acme%'"
+
+COMMON OBJECTS
+  Account, Contact, Opportunity, Lead, Case, Task, Event, User
+
+OUTPUT
+  Returns JSON array of records (or count for COUNT queries)
+
+NOTE
+  SOQL is read-only by design. This tool cannot modify any data.
+EOF
+  exit 1
+}
+
+# Resolve environment to org alias
+get_org_alias() {
+  local env="${1,,}"  # lowercase
+  if [[ -v "ORG_ALIASES[$env]" ]]; then
+    echo "${ORG_ALIASES[$env]}"
+  else
+    echo "❌ Unknown environment: $1" >&2
+    echo "   Valid: ${!ORG_ALIASES[*]}" >&2
+    exit 1
+  fi
+}
+
+# Main
+[[ $# -lt 2 ]] && usage
+
+ENV="$1"
+shift
+
+ORG_ALIAS=$(get_org_alias "$ENV")
+
+# Handle describe command
+if [[ "$1" == "describe" ]]; then
+  [[ $# -lt 2 ]] && { echo "❌ Usage: sf-query $ENV describe <ObjectName>"; exit 1; }
+  OBJECT="$2"
+  echo "📋 Describing $OBJECT in $ENV..." >&2
+  sf sobject describe --sobject "$OBJECT" --target-org "$ORG_ALIAS" --json 2>/dev/null | jq '.result.fields | map({name, type, label, length, picklistValues: (.picklistValues // [] | map(.value))})'
+  exit 0
+fi
+
+QUERY="$1"
+
+# Validate it looks like a SELECT query
+if [[ ! "$QUERY" =~ ^[[:space:]]*(SELECT|select) ]]; then
+  echo "❌ Query must start with SELECT" >&2
+  echo "   Got: $QUERY" >&2
+  exit 1
+fi
+
+echo "🔍 Querying $ENV..." >&2
+
+# Run query and extract records (filter out CLI warnings)
+RESULT=$(sf data query --query "$QUERY" --target-org "$ORG_ALIAS" --json 2>/dev/null)
+
+# Check for errors
+if echo "$RESULT" | jq -e '.status != 0' > /dev/null 2>&1; then
+  echo "$RESULT" | jq -r '.message // .result.message // "Unknown error"' >&2
+  exit 1
+fi
+
+# Output records (or totalSize for COUNT queries)
+RECORDS=$(echo "$RESULT" | jq '.result.records')
+TOTAL_SIZE=$(echo "$RESULT" | jq '.result.totalSize')
+
+if [[ "$RECORDS" == "[]" && "$TOTAL_SIZE" != "0" && "$TOTAL_SIZE" != "null" ]]; then
+  # COUNT() query - return the count
+  echo "{\"count\": $TOTAL_SIZE}"
+else
+  echo "$RECORDS"
+fi

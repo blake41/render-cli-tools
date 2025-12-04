@@ -11,7 +11,8 @@ tools/
 ├── render/               # Render CLI scripts (reference copy)
 ├── cloudflare/           # Cloudflare CLI scripts (reference copy)
 ├── github/               # GitHub Actions CLI scripts
-└── infisical/            # Infisical API scripts
+├── infisical/            # Infisical API scripts
+└── salesforce/           # Salesforce SOQL query scripts
 ```
 
 ## Installed Locations
@@ -24,6 +25,8 @@ tools/
 | Cloudflare config | `~/.config/cloudflare/` |
 | GitHub scripts | `~/.local/bin/gh-actions` |
 | GitHub config | Uses `gh` CLI auth |
+| Salesforce scripts | `~/.local/bin/sf-query` |
+| Salesforce config | Uses `sf` CLI auth |
 | Docs | This folder |
 
 ## Quick Reference
@@ -60,6 +63,18 @@ cf-logs <worker-name> --status 500  # Filter by HTTP status
 ```
 
 Note: Cloudflare logs are real-time streaming only. Historical logs require Logpush (paid).
+
+### Salesforce CLI
+
+```bash
+sf-query prod "SELECT Id, Name FROM Account LIMIT 10"
+sf-query prod "SELECT Id, Name, StageName, Amount FROM Opportunity WHERE IsClosed = false"
+sf-query prod "SELECT COUNT() FROM Contact"
+sf-query prod describe Account              # Show object fields
+sf-query sandbox "SELECT Id FROM Lead"      # Query sandbox
+```
+
+Note: SOQL is read-only by design. This tool cannot modify any Salesforce data.
 
 ### Per-Project Override
 
