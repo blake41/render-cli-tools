@@ -82,16 +82,18 @@ Note: SOQL is read-only by design. This tool cannot modify any Salesforce data.
 ### Linear CLI
 
 ```bash
-linear-cli me                              # Current user info
-linear-cli teams                           # List all teams
-linear-cli projects                        # List all projects
+# Read
 linear-cli issues --mine --limit 10        # My issues
 linear-cli issues --status "In Progress"   # Filter by status
 linear-cli issue GTM-3424                  # Get specific issue
 linear-cli search "authentication bug"     # Search issues
-```
+linear-cli teams                           # List all teams
+linear-cli projects                        # List all projects
 
-Note: This tool is read-only. To create/update issues, use the Linear UI or API directly.
+# Create (auto-assigned to you)
+linear-cli create GTM "Fix login bug"
+linear-cli create GTM "Add feature" --description "Details" --priority 2
+```
 
 ### Per-Project Override
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# linear-cli - Read-only Linear queries for AI agents
+# linear-cli - Linear issue management for AI agents
 # Linear API is GraphQL-based, this provides convenient commands
 
 set -euo pipefail
@@ -36,7 +36,7 @@ graphql() {
 
 usage() {
   cat <<EOF
-linear-cli - Read-only Linear queries for AI agents
+linear-cli - Linear issue management for AI agents
 
 USAGE
   linear-cli <command> [options]
@@ -51,6 +51,9 @@ COMMANDS
   search <query>
       Search issues by text
       
+  create <team-key> "<title>" [--description "..."] [--priority 1-4]
+      Create a new issue (auto-assigned to you)
+      
   projects
       List all projects
       
@@ -61,12 +64,17 @@ COMMANDS
       Show current user info
 
 EXAMPLES
+  # Read operations
   linear-cli issues --mine --limit 10
   linear-cli issues --project "Q1 Roadmap" --status "In Progress"
   linear-cli issue ENG-123
   linear-cli search "authentication bug"
   linear-cli projects
   linear-cli teams
+  
+  # Create issues (auto-assigned to you)
+  linear-cli create GTM "Fix login bug"
+  linear-cli create GTM "Add dark mode" --description "User requested feature" --priority 2
 
 SETUP
   1. Go to Linear Settings → Security & access → API keys
@@ -113,6 +121,84 @@ cmd_search() {
   # Escape quotes in search query
   query=$(echo "$query" | sed 's/"/\\\\"/g')
   graphql "{ searchIssues(term: \\\"$query\\\", first: 20) { nodes { id identifier title state { name } assignee { name } priority } } }" | jq '.data.searchIssues.nodes'
+}
+
+# Get current user's ID (cached for session)
+get_my_id() {
+  graphql "{ viewer { id } }" | jq -r '.data.viewer.id'
+}
+
+# Get team ID from team key
+get_team_id() {
+  local team_key="$1"
+  local result
+  result=$(graphql "{ teams(filter: { key: { eq: \\\"$team_key\\\" } }) { nodes { id } } }")
+  local team_id
+  team_id=$(echo "$result" | jq -r '.data.teams.nodes[0].id // empty')
+  
+  if [[ -z "$team_id" ]]; then
+    echo "❌ Team '$team_key' not found. Run 'linear-cli teams' to see available teams." >&2
+    exit 1
+  fi
+  echo "$team_id"
+}
+
+cmd_create() {
+  local team_key="$1"
+  local title="$2"
+  shift 2
+  
+  local description=""
+  local priority=""
+  
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --description|-d) description="$2"; shift 2 ;;
+      --priority|-p) priority="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+  
+  # Get team ID and user ID
+  local team_id
+  team_id=$(get_team_id "$team_key")
+  local my_id
+  my_id=$(get_my_id)
+  
+  # Build input fields
+  local input_fields="teamId: \\\"$team_id\\\", title: \\\"$title\\\", assigneeId: \\\"$my_id\\\""
+  
+  if [[ -n "$description" ]]; then
+    # Escape quotes and newlines in description
+    description=$(echo "$description" | sed 's/"/\\\\"/g' | tr '\n' ' ')
+    input_fields="$input_fields, description: \\\"$description\\\""
+  fi
+  
+  if [[ -n "$priority" ]]; then
+    input_fields="$input_fields, priority: $priority"
+  fi
+  
+  echo "📝 Creating issue in $team_key..." >&2
+  
+  local result
+  result=$(graphql "mutation { issueCreate(input: { $input_fields }) { success issue { id identifier title url state { name } assignee { name } } } }")
+  
+  # Check for errors
+  if echo "$result" | jq -e '.errors' > /dev/null 2>&1; then
+    echo "$result" | jq -r '.errors[0].message // "Unknown error"' >&2
+    exit 1
+  fi
+  
+  local success
+  success=$(echo "$result" | jq -r '.data.issueCreate.success')
+  
+  if [[ "$success" != "true" ]]; then
+    echo "❌ Failed to create issue" >&2
+    echo "$result" | jq >&2
+    exit 1
+  fi
+  
+  echo "$result" | jq '.data.issueCreate.issue'
 }
 
 cmd_issues() {
@@ -173,6 +259,12 @@ case "$CMD" in
     cmd_search "$*"
     ;;
   issues) cmd_issues "$@" ;;
+  create)
+    [[ $# -lt 2 ]] && { echo "Usage: linear-cli create <team-key> \"<title>\" [--description \"...\"] [--priority 1-4]"; exit 1; }
+    cmd_create "$@"
+    ;;
   help|--help|-h) usage ;;
   *) echo "Unknown command: $CMD"; usage ;;
 esac
+
+
