@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# linear-cli - Read-only Linear queries for AI agents
+# Linear API is GraphQL-based, this provides convenient commands
+
+set -euo pipefail
+
+CONFIG_DIR="${HOME}/.config/linear"
+API_URL="https://api.linear.app/graphql"
+
+# Get API key from config or environment
+get_api_key() {
+  if [[ -n "${LINEAR_API_KEY:-}" ]]; then
+    echo "$LINEAR_API_KEY"
+  elif [[ -f "$CONFIG_DIR/api-key" ]]; then
+    cat "$CONFIG_DIR/api-key"
+  else
+    echo "❌ No Linear API key found" >&2
+    echo "   Set LINEAR_API_KEY or create ~/.config/linear/api-key" >&2
+    echo "   Get your key from: Linear Settings → Security & access → API keys" >&2
+    exit 1
+  fi
+}
+
+# Execute GraphQL query
+graphql() {
+  local query="$1"
+  local api_key
+  api_key=$(get_api_key)
+  
+  curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -H "Authorization: $api_key" \
+    --data "{\"query\": \"$query\"}" \
+    "$API_URL"
+}
+
+usage() {
+  cat <<EOF
+linear-cli - Read-only Linear queries for AI agents
+
+USAGE
+  linear-cli <command> [options]
+
+COMMANDS
+  issues [--mine] [--project NAME] [--status STATUS] [--limit N]
+      List issues with optional filters
+      
+  issue <ID>
+      Get details for a specific issue (e.g., "ENG-123")
+      
+  search <query>
+      Search issues by text
+      
+  projects
+      List all projects
+      
+  teams
+      List all teams
+      
+  me
+      Show current user info
+
+EXAMPLES
+  linear-cli issues --mine --limit 10
+  linear-cli issues --project "Q1 Roadmap" --status "In Progress"
+  linear-cli issue ENG-123
+  linear-cli search "authentication bug"
+  linear-cli projects
+  linear-cli teams
+
+SETUP
+  1. Go to Linear Settings → Security & access → API keys
+  2. Create a new personal API key
+  3. Save it:
+     echo "lin_api_xxxxx" > ~/.config/linear/api-key
+     chmod 600 ~/.config/linear/api-key
+
+OUTPUT
+  Returns JSON for easy parsing by agents
+EOF
+  exit 1
+}
+
+# Commands
+cmd_me() {
+  graphql "{ viewer { id name email admin } }" | jq '.data.viewer'
+}
+
+cmd_teams() {
+  graphql "{ teams { nodes { id name key description } } }" | jq '.data.teams.nodes'
+}
+
+cmd_projects() {
+  graphql "{ projects(first: 50) { nodes { id name description state { name } lead { name } targetDate } } }" | jq '.data.projects.nodes'
+}
+
+cmd_issue() {
+  local issue_id="$1"
+  # Parse identifier like "GTM-3424" into team key and number
+  local team_key="${issue_id%-*}"
+  local number="${issue_id##*-}"
+  
+  if [[ ! "$number" =~ ^[0-9]+$ ]]; then
+    echo "❌ Invalid issue ID format. Expected: TEAM-123 (e.g., GTM-3424)" >&2
+    exit 1
+  fi
+  
+  graphql "{ issues(filter: { number: { eq: $number }, team: { key: { eq: \\\"$team_key\\\" } } }, first: 1) { nodes { id identifier title description state { name } priority assignee { name } project { name } labels { nodes { name } } createdAt updatedAt } } }" | jq '.data.issues.nodes[0] // empty'
+}
+
+cmd_search() {
+  local query="$1"
+  # Escape quotes in search query
+  query=$(echo "$query" | sed 's/"/\\\\"/g')
+  graphql "{ searchIssues(term: \\\"$query\\\", first: 20) { nodes { id identifier title state { name } assignee { name } priority } } }" | jq '.data.searchIssues.nodes'
+}
+
+cmd_issues() {
+  local mine=""
+  local project=""
+  local status=""
+  local limit=20
+  
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mine) mine="true"; shift ;;
+      --project) project="$2"; shift 2 ;;
+      --status) status="$2"; shift 2 ;;
+      --limit) limit="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+  
+  # Build filter
+  local filter=""
+  local filters=()
+  
+  if [[ -n "$mine" ]]; then
+    filters+=("assignee: { isMe: { eq: true } }")
+  fi
+  
+  if [[ -n "$status" ]]; then
+    filters+=("state: { name: { eq: \\\"$status\\\" } }")
+  fi
+  
+  if [[ -n "$project" ]]; then
+    filters+=("project: { name: { eq: \\\"$project\\\" } }")
+  fi
+  
+  if [[ ${#filters[@]} -gt 0 ]]; then
+    filter="filter: { $(IFS=', '; echo "${filters[*]}") }, "
+  fi
+  
+  graphql "{ issues(${filter}first: $limit, orderBy: updatedAt) { nodes { id identifier title state { name } priority assignee { name } project { name } updatedAt } } }" | jq '.data.issues.nodes'
+}
+
+# Main
+[[ $# -lt 1 ]] && usage
+
+CMD="$1"
+shift
+
+case "$CMD" in
+  me) cmd_me ;;
+  teams) cmd_teams ;;
+  projects) cmd_projects ;;
+  issue)
+    [[ $# -lt 1 ]] && { echo "Usage: linear-cli issue <ID>"; exit 1; }
+    cmd_issue "$1"
+    ;;
+  search)
+    [[ $# -lt 1 ]] && { echo "Usage: linear-cli search <query>"; exit 1; }
+    cmd_search "$*"
+    ;;
+  issues) cmd_issues "$@" ;;
+  help|--help|-h) usage ;;
+  *) echo "Unknown command: $CMD"; usage ;;
+esac

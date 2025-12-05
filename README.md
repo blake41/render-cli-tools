@@ -12,7 +12,8 @@ tools/
 ├── cloudflare/           # Cloudflare CLI scripts (reference copy)
 ├── github/               # GitHub Actions CLI scripts
 ├── infisical/            # Infisical API scripts
-└── salesforce/           # Salesforce SOQL query scripts
+├── salesforce/           # Salesforce SOQL query scripts
+└── linear/               # Linear issue tracking CLI
 ```
 
 ## Installed Locations
@@ -27,6 +28,8 @@ tools/
 | GitHub config | Uses `gh` CLI auth |
 | Salesforce scripts | `~/.local/bin/sf-query` |
 | Salesforce config | Uses `sf` CLI auth |
+| Linear scripts | `~/.local/bin/linear-cli` |
+| Linear config | `~/.config/linear/api-key` |
 | Docs | This folder |
 
 ## Quick Reference
@@ -75,6 +78,20 @@ sf-query sandbox "SELECT Id FROM Lead"      # Query sandbox
 ```
 
 Note: SOQL is read-only by design. This tool cannot modify any Salesforce data.
+
+### Linear CLI
+
+```bash
+linear-cli me                              # Current user info
+linear-cli teams                           # List all teams
+linear-cli projects                        # List all projects
+linear-cli issues --mine --limit 10        # My issues
+linear-cli issues --status "In Progress"   # Filter by status
+linear-cli issue GTM-3424                  # Get specific issue
+linear-cli search "authentication bug"     # Search issues
+```
+
+Note: This tool is read-only. To create/update issues, use the Linear UI or API directly.
 
 ### Per-Project Override
 
