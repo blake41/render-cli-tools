@@ -143,6 +143,14 @@ get_team_id() {
   echo "$team_id"
 }
 
+# Get "Todo" state ID for a team
+get_todo_state_id() {
+  local team_key="$1"
+  local result
+  result=$(graphql "{ workflowStates(filter: { team: { key: { eq: \\\"$team_key\\\" } }, name: { eq: \\\"Todo\\\" } }) { nodes { id } } }")
+  echo "$result" | jq -r '.data.workflowStates.nodes[0].id // empty'
+}
+
 cmd_create() {
   local team_key="$1"
   local title="$2"
@@ -159,14 +167,21 @@ cmd_create() {
     esac
   done
   
-  # Get team ID and user ID
+  # Get team ID, user ID, and Todo state ID
   local team_id
   team_id=$(get_team_id "$team_key")
   local my_id
   my_id=$(get_my_id)
+  local todo_state_id
+  todo_state_id=$(get_todo_state_id "$team_key")
   
   # Build input fields
   local input_fields="teamId: \\\"$team_id\\\", title: \\\"$title\\\", assigneeId: \\\"$my_id\\\""
+  
+  # Set state to Todo if found
+  if [[ -n "$todo_state_id" ]]; then
+    input_fields="$input_fields, stateId: \\\"$todo_state_id\\\""
+  fi
   
   if [[ -n "$description" ]]; then
     # Escape quotes and newlines in description
