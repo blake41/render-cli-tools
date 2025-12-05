@@ -30,6 +30,7 @@ tools/
 | Salesforce config | Uses `sf` CLI auth |
 | Linear scripts | `~/.local/bin/linear-cli` |
 | Linear config | `~/.config/linear/api-key` |
+| iMessage | `~/.local/bin/imsg` (via go install) |
 | Docs | This folder |
 
 ## Quick Reference
@@ -47,6 +48,17 @@ gh-actions failures --since 7d           # Last week's failures
 gh-actions rerun <run-id>                # Re-run a workflow
 gh-actions rerun <run-id> --failed       # Re-run only failed jobs
 ```
+
+### PR Workflow (pr-ship)
+
+```bash
+pr-ship                    # Create PR → wait for green → rebase merge → cleanup
+pr-ship --no-merge         # Create PR, check status, don't merge  
+pr-ship --no-create        # Merge existing PR on current branch
+pr-ship --wait 600         # Wait up to 10 min for checks
+```
+
+Workflow: Creates PR with `--fill`, polls for CI green, rebases & merges, then runs `finish-pr`.
 
 ### Render CLI
 
@@ -94,6 +106,17 @@ linear-cli projects                        # List all projects
 linear-cli create GTM "Fix login bug"
 linear-cli create GTM "Add feature" --description "Details" --priority 2
 ```
+
+### iMessage CLI
+
+```bash
+imsg chats --limit 10                    # List recent conversations
+imsg history --chat-id 138 --limit 20    # View message history
+imsg history --chat-id 138 --json        # JSON output for parsing
+imsg send --to "+14155551212" --text "Hello!"  # Send a message
+```
+
+Requires Full Disk Access for terminal. From [github.com/steipete/imsg](https://github.com/steipete/imsg)
 
 ### Per-Project Override
 

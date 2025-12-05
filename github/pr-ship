@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# pr-ship - Create, wait for green, and merge a PR in one command
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+pr-ship - Ship a PR: create → wait for green → rebase merge → cleanup
+
+USAGE
+  pr-ship [options]
+
+OPTIONS
+  --no-create       Skip PR creation (use existing PR on current branch)
+  --no-merge        Create PR but don't merge (just check status)
+  --wait <seconds>  Max seconds to wait for checks (default: 300)
+  --poll <seconds>  Poll interval for checks (default: 10)
+  -h, --help        Show this help
+
+WORKFLOW
+  1. Creates PR with --fill (title/body from commits)
+  2. Waits for CI checks to pass
+  3. Rebases and merges when green
+  4. Runs finish-pr to cleanup local branch
+
+EXAMPLES
+  pr-ship                    # Full workflow
+  pr-ship --no-merge         # Create PR, check status, don't merge
+  pr-ship --no-create        # Merge existing PR on current branch
+  pr-ship --wait 600         # Wait up to 10 minutes for checks
+EOF
+  exit 0
+}
+
+# Defaults
+CREATE_PR=true
+DO_MERGE=true
+MAX_WAIT=300
+POLL_INTERVAL=10
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-create) CREATE_PR=false; shift ;;
+    --no-merge) DO_MERGE=false; shift ;;
+    --wait) MAX_WAIT="$2"; shift 2 ;;
+    --poll) POLL_INTERVAL="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "Unknown option: $1"; usage ;;
+  esac
+done
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+info() { echo -e "${BLUE}→${NC} $1"; }
+success() { echo -e "${GREEN}✓${NC} $1"; }
+warn() { echo -e "${YELLOW}⚠${NC} $1"; }
+error() { echo -e "${RED}✗${NC} $1"; }
+
+# Get current branch
+BRANCH=$(git branch --show-current)
+if [[ -z "$BRANCH" ]]; then
+  error "Not on a branch"
+  exit 1
+fi
+
+# Step 1: Create PR
+if [[ "$CREATE_PR" == "true" ]]; then
+  info "Creating PR for branch: $BRANCH"
+  
+  # Check if PR already exists
+  EXISTING_PR=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
+  if [[ -n "$EXISTING_PR" ]]; then
+    warn "PR #$EXISTING_PR already exists for this branch"
+    PR_NUMBER="$EXISTING_PR"
+  else
+    # Create PR with defaults
+    PR_URL=$(gh pr create --fill 2>&1)
+    PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$' || gh pr view --json number --jq '.number')
+    success "Created PR #$PR_NUMBER"
+  fi
+else
+  # Get existing PR number
+  PR_NUMBER=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
+  if [[ -z "$PR_NUMBER" ]]; then
+    error "No PR found for current branch. Run without --no-create first."
+    exit 1
+  fi
+  info "Using existing PR #$PR_NUMBER"
+fi
+
+# Step 2: Wait for checks and mergeable status
+info "Waiting for checks to complete (max ${MAX_WAIT}s)..."
+
+ELAPSED=0
+while [[ $ELAPSED -lt $MAX_WAIT ]]; do
+  # Get PR status
+  STATUS_JSON=$(gh pr view "$PR_NUMBER" --json mergeable,mergeStateStatus,statusCheckRollup,state)
+  
+  MERGEABLE=$(echo "$STATUS_JSON" | jq -r '.mergeable')
+  MERGE_STATE=$(echo "$STATUS_JSON" | jq -r '.mergeStateStatus')
+  PR_STATE=$(echo "$STATUS_JSON" | jq -r '.state')
+  
+  # Check if PR is already merged or closed
+  if [[ "$PR_STATE" == "MERGED" ]]; then
+    success "PR already merged!"
+    exit 0
+  elif [[ "$PR_STATE" == "CLOSED" ]]; then
+    error "PR is closed"
+    exit 1
+  fi
+  
+  # Get check status
+  CHECK_STATUS=$(echo "$STATUS_JSON" | jq -r '.statusCheckRollup // [] | if length == 0 then "NONE" else (if all(.status == "COMPLETED" and .conclusion == "SUCCESS") then "SUCCESS" elif any(.status == "COMPLETED" and .conclusion == "FAILURE") then "FAILURE" elif any(.status == "IN_PROGRESS" or .status == "QUEUED" or .status == "PENDING") then "PENDING" else "UNKNOWN" end) end')
+  
+  # Report status
+  printf "\r  Checks: %-10s | Mergeable: %-12s | State: %-10s | %ds elapsed" "$CHECK_STATUS" "$MERGE_STATE" "$MERGEABLE" "$ELAPSED"
+  
+  # Check if we can merge
+  if [[ "$MERGEABLE" == "MERGEABLE" && "$MERGE_STATE" == "CLEAN" ]]; then
+    echo ""
+    success "PR is green and ready to merge!"
+    break
+  elif [[ "$MERGE_STATE" == "DIRTY" ]]; then
+    echo ""
+    error "PR has merge conflicts. Resolve conflicts and try again."
+    exit 1
+  elif [[ "$MERGE_STATE" == "BLOCKED" ]]; then
+    echo ""
+    error "PR is blocked by branch protection rules."
+    gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '.statusCheckRollup[] | select(.conclusion != "SUCCESS") | "\(.context): \(.conclusion // .status)"'
+    exit 1
+  elif [[ "$CHECK_STATUS" == "FAILURE" ]]; then
+    echo ""
+    error "CI checks failed:"
+    gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '.statusCheckRollup[] | select(.conclusion == "FAILURE") | "  \(.context): \(.conclusion)"'
+    exit 1
+  fi
+  
+  sleep "$POLL_INTERVAL"
+  ELAPSED=$((ELAPSED + POLL_INTERVAL))
+done
+
+# Check if we timed out
+if [[ $ELAPSED -ge $MAX_WAIT ]]; then
+  echo ""
+  warn "Timed out waiting for checks after ${MAX_WAIT}s"
+  warn "Current state: mergeable=$MERGEABLE, mergeState=$MERGE_STATE"
+  exit 1
+fi
+
+# Step 3: Merge
+if [[ "$DO_MERGE" == "true" ]]; then
+  info "Rebasing and merging PR #$PR_NUMBER..."
+  
+  if gh pr merge "$PR_NUMBER" --rebase --delete-branch; then
+    success "PR #$PR_NUMBER merged successfully!"
+    
+    # Step 4: Run finish-pr if available
+    if command -v finish-pr &> /dev/null; then
+      info "Running finish-pr to cleanup..."
+      finish-pr
+      success "All done! 🚀"
+    else
+      warn "finish-pr not found, skipping local cleanup"
+      info "You may want to: git checkout main && git pull"
+    fi
+  else
+    error "Failed to merge PR"
+    exit 1
+  fi
+else
+  success "PR #$PR_NUMBER is ready to merge (--no-merge specified)"
+  echo "  Run: gh pr merge $PR_NUMBER --rebase --delete-branch"
+fi
