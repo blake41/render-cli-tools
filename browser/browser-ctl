@@ -115,20 +115,43 @@ async function cmdScreenshot(args) {
 }
 
 async function cmdLogs(args) {
-  const { page, browser, contexts } = await connect();
+  const LOG_FILE = process.env.BROWSER_LOG_FILE || '/tmp/browser-ctl-logs.jsonl';
   
   let level = null;
   let json = false;
+  let follow = false;
+  let lines = 50;  // default last N lines
   let clear = false;
+  let all = false;
   
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--level' || args[i] === '-l') {
       level = args[++i];
     } else if (args[i] === '--json' || args[i] === '-j') {
       json = true;
+    } else if (args[i] === '--follow' || args[i] === '-f') {
+      follow = true;
+    } else if (args[i] === '--lines' || args[i] === '-n') {
+      lines = parseInt(args[++i]);
+    } else if (args[i] === '--all' || args[i] === '-a') {
+      all = true;
     } else if (args[i] === '--clear' || args[i] === '-c') {
       clear = true;
     }
+  }
+  
+  // Clear log file if requested
+  if (clear) {
+    fs.writeFileSync(LOG_FILE, '');
+    console.log(`${c.green}Logs cleared${c.reset}`);
+    return;
+  }
+  
+  // Check if log file exists
+  if (!fs.existsSync(LOG_FILE)) {
+    console.error(`${c.red}No log file found at ${LOG_FILE}${c.reset}`);
+    console.error(`\nStart Chrome with: ${c.cyan}browser-open${c.reset}`);
+    process.exit(1);
   }
   
   const levels = ['debug', 'log', 'info', 'warn', 'error'];
@@ -144,82 +167,96 @@ async function cmdLogs(args) {
     return (colors[lvl] || c.reset) + lvl.toUpperCase().padEnd(5) + c.reset;
   }
   
-  function timestamp() {
-    return c.dim + new Date().toISOString().split('T')[1].slice(0, 12) + c.reset;
+  function formatEntry(entry) {
+    if (json) {
+      console.log(JSON.stringify(entry));
+      return;
+    }
+    
+    // Skip collector meta messages unless showing all
+    if (entry.type === 'collector' && !all) return;
+    
+    const ts = c.dim + (entry.ts || '').split('T')[1]?.slice(0, 12) || '' + c.reset;
+    const lvl = formatLevel(entry.level);
+    const loc = entry.url ? ` ${c.dim}(${path.basename(entry.url)}${entry.line ? ':' + entry.line : ''})${c.reset}` : '';
+    const typeTag = entry.type && entry.type !== 'collector' ? `${c.dim}[${entry.type.toUpperCase()}]${c.reset} ` : '';
+    
+    console.log(`${ts} ${lvl} ${typeTag}${entry.message}${loc}`);
   }
-
-  // Listen on all pages
-  const allPages = contexts.flatMap(ctx => ctx.pages());
   
-  for (const p of allPages) {
-    p.on('console', msg => {
-      const type = msg.type() === 'warning' ? 'warn' : msg.type();
-      if (!shouldShow(type)) return;
-      
-      const text = msg.text();
-      const location = msg.location();
-      const loc = location.url ? ` ${c.dim}(${path.basename(location.url)}:${location.lineNumber})${c.reset}` : '';
-      
-      if (json) {
-        console.log(JSON.stringify({ level: type, message: text, url: location.url, line: location.lineNumber, timestamp: new Date().toISOString() }));
-      } else {
-        console.log(`${timestamp()} ${formatLevel(type)} ${text}${loc}`);
+  // Read and display existing logs
+  const content = fs.readFileSync(LOG_FILE, 'utf8');
+  const allLines = content.trim().split('\n').filter(Boolean);
+  
+  // Get last N lines (or all if --all)
+  const linesToShow = all ? allLines : allLines.slice(-lines);
+  
+  let shown = 0;
+  for (const line of linesToShow) {
+    try {
+      const entry = JSON.parse(line);
+      if (!shouldShow(entry.level)) continue;
+      formatEntry(entry);
+      shown++;
+    } catch (e) {
+      // Skip malformed lines
+    }
+  }
+  
+  if (!json && !follow) {
+    if (shown === 0) {
+      console.log(`${c.dim}No logs found${level ? ` at level '${level}' or above` : ''}${c.reset}`);
+    } else {
+      console.log(`${c.dim}─── Showing ${shown} of ${allLines.length} entries ───${c.reset}`);
+    }
+  }
+  
+  // Follow mode - tail the file
+  if (follow) {
+    if (!json) {
+      console.log(`${c.cyan}● Following logs...${c.reset} ${c.dim}(Ctrl+C to stop)${c.reset}\n`);
+    }
+    
+    let lastSize = fs.statSync(LOG_FILE).size;
+    
+    const watcher = setInterval(() => {
+      try {
+        const stats = fs.statSync(LOG_FILE);
+        if (stats.size > lastSize) {
+          // Read new content
+          const fd = fs.openSync(LOG_FILE, 'r');
+          const buffer = Buffer.alloc(stats.size - lastSize);
+          fs.readSync(fd, buffer, 0, buffer.length, lastSize);
+          fs.closeSync(fd);
+          
+          const newLines = buffer.toString().trim().split('\n').filter(Boolean);
+          for (const line of newLines) {
+            try {
+              const entry = JSON.parse(line);
+              if (!shouldShow(entry.level)) continue;
+              formatEntry(entry);
+            } catch (e) {}
+          }
+          
+          lastSize = stats.size;
+        } else if (stats.size < lastSize) {
+          // File was truncated/rotated
+          lastSize = stats.size;
+        }
+      } catch (e) {
+        // File might be temporarily unavailable
       }
+    }, 200);
+    
+    process.on('SIGINT', () => {
+      clearInterval(watcher);
+      if (!json) console.log(`\n${c.dim}Stopped.${c.reset}`);
+      process.exit(0);
     });
     
-    p.on('pageerror', err => {
-      if (!shouldShow('error')) return;
-      if (json) {
-        console.log(JSON.stringify({ level: 'error', message: err.message, stack: err.stack, timestamp: new Date().toISOString() }));
-      } else {
-        console.log(`${timestamp()} ${c.red}ERROR${c.reset} ${c.red}[EXCEPTION]${c.reset} ${err.message}`);
-      }
-    });
-
-    p.on('requestfailed', req => {
-      if (!shouldShow('error')) return;
-      const failure = req.failure();
-      if (failure?.errorText === 'net::ERR_ABORTED') return;
-      if (json) {
-        console.log(JSON.stringify({ level: 'error', message: `Network: ${failure?.errorText}`, url: req.url(), timestamp: new Date().toISOString() }));
-      } else {
-        console.log(`${timestamp()} ${c.red}ERROR${c.reset} ${c.red}[NETWORK]${c.reset} ${failure?.errorText} - ${req.url()}`);
-      }
-    });
+    // Keep running
+    await new Promise(() => {});
   }
-  
-  // Listen for new pages
-  for (const ctx of contexts) {
-    ctx.on('page', newPage => {
-      if (!json) console.log(`${c.cyan}● New tab opened${c.reset}`);
-      // Attach same listeners...
-      newPage.on('console', msg => {
-        const type = msg.type() === 'warning' ? 'warn' : msg.type();
-        if (!shouldShow(type)) return;
-        const text = msg.text();
-        if (json) {
-          console.log(JSON.stringify({ level: type, message: text, timestamp: new Date().toISOString() }));
-        } else {
-          console.log(`${timestamp()} ${formatLevel(type)} ${text}`);
-        }
-      });
-    });
-  }
-  
-  if (!json) {
-    console.log(`${c.cyan}● Connected to Chrome${c.reset} (${allPages.length} page${allPages.length > 1 ? 's' : ''})`);
-    console.log(`${c.dim}  Press Ctrl+C to stop${c.reset}\n`);
-  }
-  
-  // Keep alive
-  process.on('SIGINT', async () => {
-    if (!json) console.log(`\n${c.dim}Disconnecting...${c.reset}`);
-    await browser.close();
-    process.exit(0);
-  });
-  
-  // Keep process running
-  await new Promise(() => {});
 }
 
 async function cmdClick(args) {
@@ -469,8 +506,13 @@ ${c.yellow}COMMANDS${c.reset}
   ${c.green}screenshot${c.reset} [selector] [--full] [-o file]
       Take screenshot of page or element
       
-  ${c.green}logs${c.reset} [--level LEVEL] [--json]
-      Stream console logs (levels: debug, log, info, warn, error)
+  ${c.green}logs${c.reset} [--level LEVEL] [--json] [-n LINES] [--follow] [--clear]
+      Show console logs from log file (collected by browser-open daemon)
+      -n, --lines N    Show last N lines (default: 50)
+      -a, --all        Show all logs
+      -f, --follow     Tail the log file (like tail -f)
+      -c, --clear      Clear the log file
+      Levels: debug, log, info, warn, error
       
   ${c.green}click${c.reset} <selector>
       Click an element
@@ -510,7 +552,10 @@ ${c.yellow}COMMANDS${c.reset}
 
 ${c.yellow}EXAMPLES${c.reset}
   browser-ctl screenshot --full
-  browser-ctl logs --level warn
+  browser-ctl logs                        # Last 50 log entries
+  browser-ctl logs --level error          # Only errors
+  browser-ctl logs -n 100 --json          # Last 100 as JSON
+  browser-ctl logs --follow               # Tail logs (like tail -f)
   browser-ctl click "button[type=submit]"
   browser-ctl type "#search" "hello world"
   browser-ctl goto /accounts

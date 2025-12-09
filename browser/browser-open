@@ -52,7 +52,7 @@ EXAMPLES
 
 NOTES
   Uses ~/.cursor-chrome-profile by default (preserves auth sessions)
-  After opening, run 'browser-logs' in another terminal to stream logs
+  Automatically starts log collector - view logs with 'browser-ctl logs'
   
   IMPORTANT: If Chrome is already running, --remote-debugging-port is ignored.
   Use --force to quit and restart Chrome, or quit Chrome manually first.
@@ -70,6 +70,30 @@ EOF
     esac
 done
 
+# Resolve symlinks to get real script directory
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" || echo "$0")")" && pwd)"
+LOG_FILE="/tmp/browser-ctl-logs.jsonl"
+PID_FILE="/tmp/browser-log-collector.pid"
+
+# Start log collector if not running
+start_collector() {
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        return 0  # Already running
+    fi
+    # Kill any orphaned collectors
+    pkill -f "log-collector.js" 2>/dev/null || true
+    # Start collector in background with proper detachment
+    ( cd "$SCRIPT_DIR" && node log-collector.js --port "$PORT" >> /tmp/browser-log-collector.log 2>&1 ) &
+    disown
+    sleep 1  # Give it time to start and create PID file
+    if [[ -f "$PID_FILE" ]]; then
+        return 0
+    else
+        echo "⚠️  Log collector failed to start. Check /tmp/browser-log-collector.log"
+        return 1
+    fi
+}
+
 # Check if Chrome is already running
 if pgrep -q "Google Chrome"; then
     # Check if debugging port is already active
@@ -77,9 +101,9 @@ if pgrep -q "Google Chrome"; then
         echo "✓ Chrome is already running with debugging on port $PORT"
         echo "  Opening: $URL"
         open -a "Google Chrome" "$URL"
+        start_collector
         echo ""
-        echo "In another terminal, run:"
-        echo "  browser-logs"
+        echo "Logs: browser-ctl logs"
         exit 0
     fi
     
@@ -115,9 +139,10 @@ echo -n "Waiting for debugging port..."
 for i in {1..10}; do
     if curl -s "http://localhost:$PORT/json/version" > /dev/null 2>&1; then
         echo " ready!"
+        start_collector
         echo ""
-        echo "In another terminal, run:"
-        echo "  browser-logs"
+        echo "Log collector started. View logs with:"
+        echo "  browser-ctl logs"
         exit 0
     fi
     echo -n "."

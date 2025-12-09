@@ -55,8 +55,11 @@ browser-open --force                      # Restart Chrome with debugging
 browser-ctl screenshot                    # Screenshot current page
 browser-ctl screenshot --full             # Full page screenshot
 browser-ctl screenshot ".element"         # Screenshot element
-browser-ctl logs                          # Stream console logs
+browser-ctl logs                          # Show last 50 log entries (instant)
 browser-ctl logs --level error            # Only errors
+browser-ctl logs -n 100 --json            # Last 100 entries as JSON
+browser-ctl logs --follow                 # Tail logs live (Ctrl+C to stop)
+browser-ctl logs --clear                  # Clear log history
 browser-ctl click "button.submit"         # Click element
 browser-ctl type "#input" "hello"         # Type into input
 browser-ctl goto /accounts                # Navigate (relative URL)
