@@ -71,11 +71,13 @@ async function connect() {
 // Commands
 
 async function cmdScreenshot(args) {
+  const { execSync } = require('child_process');
   const { page, browser } = await connect();
   
   let selector = null;
   let fullPage = false;
   let filename = null;
+  let maxDimension = 1500; // Default max dimension (under 2000px limit for AI models)
   
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--full' || args[i] === '-f') {
@@ -84,6 +86,10 @@ async function cmdScreenshot(args) {
       selector = args[++i];
     } else if (args[i] === '--output' || args[i] === '-o') {
       filename = args[++i];
+    } else if (args[i] === '--max' || args[i] === '-m') {
+      maxDimension = parseInt(args[++i]);
+    } else if (args[i] === '--no-resize') {
+      maxDimension = null;
     } else if (!args[i].startsWith('-')) {
       selector = args[i];
     }
@@ -105,9 +111,25 @@ async function cmdScreenshot(args) {
       await page.screenshot({ path: filename, fullPage });
     }
     
-    console.log(`${c.green}Screenshot saved:${c.reset} ${filename}`);
+    // Resize to max dimension if needed (keeps aspect ratio, uses macOS sips)
+    if (maxDimension) {
+      try {
+        // Get current dimensions
+        const info = execSync(`sips -g pixelWidth -g pixelHeight "${filename}" 2>/dev/null`, { encoding: 'utf8' });
+        const width = parseInt(info.match(/pixelWidth:\s*(\d+)/)?.[1] || '0');
+        const height = parseInt(info.match(/pixelHeight:\s*(\d+)/)?.[1] || '0');
+        
+        if (width > maxDimension || height > maxDimension) {
+          // Resize to fit within maxDimension, maintaining aspect ratio
+          execSync(`sips --resampleHeightWidthMax ${maxDimension} "${filename}" >/dev/null 2>&1`);
+          console.log(`${c.dim}Resized to max ${maxDimension}px${c.reset}`);
+        }
+      } catch (e) {
+        // sips not available or failed, continue without resize
+      }
+    }
     
-    // Also output the path for easy parsing
+    console.log(`${c.green}Screenshot saved:${c.reset} ${filename}`);
     console.log(`${c.dim}Page: ${page.url()}${c.reset}`);
   } finally {
     await browser.close();
@@ -503,8 +525,9 @@ ${c.yellow}USAGE${c.reset}
   browser-ctl <command> [options]
 
 ${c.yellow}COMMANDS${c.reset}
-  ${c.green}screenshot${c.reset} [selector] [--full] [-o file]
+  ${c.green}screenshot${c.reset} [selector] [--full] [-o file] [--max N] [--no-resize]
       Take screenshot of page or element
+      Auto-resizes to 1500px max (AI-friendly). Use --no-resize to disable.
       
   ${c.green}logs${c.reset} [--level LEVEL] [--json] [-n LINES] [--follow] [--clear]
       Show console logs from log file (collected by browser-open daemon)
