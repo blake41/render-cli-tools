@@ -60,7 +60,7 @@ cmd_projects_list() {
     
     echo "Projects:"
     echo "========="
-    infisical_api "/v2/organizations/projects" | jq -r '.projects[] | "\(.id)\t\(.name)\t\(.environments | length) envs"' | column -t -s $'\t'
+    infisical_api "/v1/workspace" | jq -r '.workspaces[] | "\(.id)\t\(.name)\t\(.environments | length) envs"' | column -t -s $'\t'
 }
 
 cmd_projects_get() {

@@ -1,0 +1,129 @@
+#!/bin/bash
+# browser-open - Launch Chrome with remote debugging for browser-logs
+#
+# Usage:
+#   browser-open                        # Open localhost:5173
+#   browser-open http://localhost:3000  # Open specific URL
+#   browser-open --port 9223            # Custom debugging port
+#
+# This enables the Chrome DevTools Protocol so browser-logs can connect.
+
+set -euo pipefail
+
+# Defaults
+PORT=9222
+PROFILE="/Users/blake/.cursor-chrome-profile"
+URL="http://localhost:5173"
+FORCE=false
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port|-p)
+            PORT="$2"
+            shift 2
+            ;;
+        --profile)
+            PROFILE="$2"
+            shift 2
+            ;;
+        --force|-f)
+            FORCE=true
+            shift
+            ;;
+        --help|-h)
+            cat <<EOF
+browser-open - Launch Chrome with remote debugging enabled
+
+USAGE
+  browser-open [options] [URL]
+
+OPTIONS
+  --port, -p N     Debugging port (default: 9222)
+  --profile PATH   Chrome profile directory
+  --force, -f      Quit Chrome and restart with debugging
+  --help, -h       Show this help
+
+EXAMPLES
+  browser-open                           # Open localhost:5173
+  browser-open http://localhost:3000     # Open specific URL
+  browser-open --port 9223 http://...    # Custom port
+  browser-open --force                   # Restart Chrome with debugging
+
+NOTES
+  Uses ~/.cursor-chrome-profile by default (preserves auth sessions)
+  After opening, run 'browser-logs' in another terminal to stream logs
+  
+  IMPORTANT: If Chrome is already running, --remote-debugging-port is ignored.
+  Use --force to quit and restart Chrome, or quit Chrome manually first.
+EOF
+            exit 0
+            ;;
+        http://*|https://*)
+            URL="$1"
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Check if Chrome is already running
+if pgrep -q "Google Chrome"; then
+    # Check if debugging port is already active
+    if curl -s "http://localhost:$PORT/json/version" > /dev/null 2>&1; then
+        echo "✓ Chrome is already running with debugging on port $PORT"
+        echo "  Opening: $URL"
+        open -a "Google Chrome" "$URL"
+        echo ""
+        echo "In another terminal, run:"
+        echo "  browser-logs"
+        exit 0
+    fi
+    
+    if [[ "$FORCE" == "true" ]]; then
+        echo "Quitting Chrome to enable debugging..."
+        osascript -e 'tell application "Google Chrome" to quit' 2>/dev/null || true
+        sleep 2
+    else
+        echo "⚠️  Chrome is running WITHOUT remote debugging enabled."
+        echo ""
+        echo "Options:"
+        echo "  1. Run with --force to quit Chrome and restart with debugging:"
+        echo "     browser-open --force $URL"
+        echo ""
+        echo "  2. Quit Chrome manually (Cmd+Q), then run browser-open again"
+        echo ""
+        echo "  3. Use Chrome DevTools directly (no browser-logs integration)"
+        exit 1
+    fi
+fi
+
+echo "Opening Chrome with remote debugging on port $PORT..."
+echo "URL: $URL"
+echo ""
+
+open -na "Google Chrome" --args \
+    --remote-debugging-port="$PORT" \
+    --user-data-dir="$PROFILE" \
+    "$URL"
+
+# Wait for debugging port to become available
+echo -n "Waiting for debugging port..."
+for i in {1..10}; do
+    if curl -s "http://localhost:$PORT/json/version" > /dev/null 2>&1; then
+        echo " ready!"
+        echo ""
+        echo "In another terminal, run:"
+        echo "  browser-logs"
+        exit 0
+    fi
+    echo -n "."
+    sleep 0.5
+done
+
+echo ""
+echo "⚠️  Debugging port not responding. Chrome may have connected to an existing instance."
+echo "   Try: browser-open --force $URL"

@@ -1,0 +1,341 @@
+#!/bin/bash
+# tmux-monitor: AI-friendly tmux session monitoring
+# Part of the developer tools collection
+
+set -e
+
+show_help() {
+    cat << 'EOF'
+tmux-monitor - Monitor tmux sessions for AI agents
+
+USAGE:
+    tmux-monitor [COMMAND] [OPTIONS]
+
+COMMANDS:
+    list        List all sessions with recent output (default)
+    status      Quick status of all sessions (is anything running/failed?)
+    wait        Wait for a session to complete
+    run         Start a command in a new tmux session and optionally wait
+    output      Get full output from a session
+    kill        Kill a session
+
+OPTIONS:
+    --json      Output in JSON format (default for most commands)
+    --plain     Output in human-readable format
+
+EXAMPLES:
+    # List all sessions with their status
+    tmux-monitor list
+
+    # Check if any processes have failed
+    tmux-monitor status
+
+    # Run tests and wait for completion
+    tmux-monitor run test-suite "npm test" --wait
+
+    # Start dev server (don't wait)
+    tmux-monitor run dev-server "npm run dev"
+
+    # Wait for a session to complete (with timeout)
+    tmux-monitor wait test-suite --timeout 300
+
+    # Get full output from a session
+    tmux-monitor output dev-server --lines 100
+
+    # Kill a session
+    tmux-monitor kill test-suite
+
+REQUIREMENTS:
+    - tmux
+    - tmuxwatch (brew install steipete/tap/tmuxwatch)
+    - jq
+
+EOF
+}
+
+require_deps() {
+    for dep in tmux tmuxwatch jq; do
+        if ! command -v "$dep" &>/dev/null; then
+            echo "Error: $dep is required but not installed" >&2
+            exit 1
+        fi
+    done
+}
+
+# List all sessions with status and recent output
+cmd_list() {
+    local format="${1:-json}"
+    
+    if ! tmux list-sessions &>/dev/null; then
+        if [[ "$format" == "json" ]]; then
+            echo '{"sessions": [], "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}'
+        else
+            echo "No tmux sessions running"
+        fi
+        return 0
+    fi
+    
+    local state
+    state=$(tmuxwatch --dump 2>/dev/null)
+    
+    local sessions=()
+    while IFS= read -r session; do
+        local session_name
+        session_name=$(echo "$session" | jq -r '.Name')
+        
+        # Capture recent output (last 30 lines)
+        local content
+        content=$(tmux capture-pane -t "$session_name" -p 2>/dev/null | tail -30 || echo "")
+        
+        # Get pane info
+        local pane_cmd is_dead dead_status
+        pane_cmd=$(echo "$session" | jq -r '.Windows[0].Panes[0].CurrentCmd // "unknown"')
+        is_dead=$(echo "$session" | jq -r '.Windows[0].Panes[0].Dead // false')
+        dead_status=$(echo "$session" | jq -r '.Windows[0].Panes[0].DeadStatus // 0')
+        
+        # Determine status
+        local status="running"
+        if [[ "$is_dead" == "true" ]]; then
+            if [[ "$dead_status" == "0" ]]; then
+                status="completed"
+            else
+                status="failed"
+            fi
+        fi
+        
+        # Build session JSON
+        local session_json
+        session_json=$(jq -n \
+            --arg name "$session_name" \
+            --arg cmd "$pane_cmd" \
+            --arg status "$status" \
+            --argjson exit_code "$dead_status" \
+            --arg output "$content" \
+            --argjson created "$(echo "$session" | jq '.CreatedAt')" \
+            '{
+                name: $name,
+                current_cmd: $cmd,
+                status: $status,
+                exit_code: (if $status == "running" then null else $exit_code end),
+                recent_output: $output,
+                created_at: $created
+            }'
+        )
+        sessions+=("$session_json")
+    done < <(echo "$state" | jq -c '.Sessions[]')
+    
+    if [[ "$format" == "json" ]]; then
+        printf '%s\n' "${sessions[@]}" | jq -s '{ sessions: ., timestamp: (now | todate) }'
+    else
+        for s in "${sessions[@]}"; do
+            local name status output
+            name=$(echo "$s" | jq -r '.name')
+            status=$(echo "$s" | jq -r '.status')
+            output=$(echo "$s" | jq -r '.recent_output' | tail -5)
+            
+            echo "━━━ $name [$status] ━━━"
+            echo "$output"
+            echo ""
+        done
+    fi
+}
+
+# Quick status check
+cmd_status() {
+    local format="${1:-json}"
+    
+    if ! tmux list-sessions &>/dev/null; then
+        if [[ "$format" == "json" ]]; then
+            echo '{"running": 0, "completed": 0, "failed": 0, "sessions": []}'
+        else
+            echo "No sessions"
+        fi
+        return 0
+    fi
+    
+    local list_output
+    list_output=$(cmd_list json)
+    
+    local running completed failed
+    running=$(echo "$list_output" | jq '[.sessions[] | select(.status == "running")] | length')
+    completed=$(echo "$list_output" | jq '[.sessions[] | select(.status == "completed")] | length')
+    failed=$(echo "$list_output" | jq '[.sessions[] | select(.status == "failed")] | length')
+    
+    if [[ "$format" == "json" ]]; then
+        echo "$list_output" | jq --argjson r "$running" --argjson c "$completed" --argjson f "$failed" \
+            '{running: $r, completed: $c, failed: $f, sessions: [.sessions[] | {name, status, exit_code}]}'
+    else
+        echo "Running: $running | Completed: $completed | Failed: $failed"
+        echo "$list_output" | jq -r '.sessions[] | "  \(.name): \(.status)"'
+    fi
+}
+
+# Run a command in a new session
+cmd_run() {
+    local session_name="$1"
+    local command="$2"
+    local wait_for_completion=false
+    local timeout=0
+    
+    shift 2
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --wait) wait_for_completion=true; shift ;;
+            --timeout) timeout="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    
+    # Kill existing session if it exists
+    tmux kill-session -t "$session_name" 2>/dev/null || true
+    
+    # Create new session with remain-on-exit so we can see the exit status
+    tmux new-session -d -s "$session_name"
+    tmux set-option -t "$session_name" remain-on-exit on
+    tmux send-keys -t "$session_name" "$command" Enter
+    
+    echo '{"action": "started", "session": "'"$session_name"'", "command": "'"$command"'"}'
+    
+    if [[ "$wait_for_completion" == true ]]; then
+        cmd_wait "$session_name" "$timeout"
+    fi
+}
+
+# Wait for session to complete
+cmd_wait() {
+    local session_name="$1"
+    local timeout="${2:-0}"
+    local start_time
+    start_time=$(date +%s)
+    
+    while true; do
+        if ! tmux has-session -t "$session_name" 2>/dev/null; then
+            echo '{"error": "session_not_found", "session": "'"$session_name"'"}'
+            return 1
+        fi
+        
+        local state
+        state=$(tmuxwatch --dump 2>/dev/null | jq '.Sessions[] | select(.Name == "'"$session_name"'")')
+        local is_dead
+        is_dead=$(echo "$state" | jq -r '.Windows[0].Panes[0].Dead // false')
+        
+        if [[ "$is_dead" == "true" ]]; then
+            local exit_code output
+            exit_code=$(echo "$state" | jq -r '.Windows[0].Panes[0].DeadStatus // 0')
+            output=$(tmux capture-pane -t "$session_name" -p 2>/dev/null | tail -50)
+            
+            jq -n \
+                --arg session "$session_name" \
+                --argjson exit_code "$exit_code" \
+                --arg output "$output" \
+                '{
+                    session: $session,
+                    status: (if $exit_code == 0 then "completed" else "failed" end),
+                    exit_code: $exit_code,
+                    output: $output
+                }'
+            return "$exit_code"
+        fi
+        
+        if [[ "$timeout" -gt 0 ]]; then
+            local elapsed
+            elapsed=$(($(date +%s) - start_time))
+            if [[ "$elapsed" -ge "$timeout" ]]; then
+                echo '{"error": "timeout", "session": "'"$session_name"'", "elapsed": '"$elapsed"'}'
+                return 124
+            fi
+        fi
+        
+        sleep 1
+    done
+}
+
+# Get full output from a session
+cmd_output() {
+    local session_name="$1"
+    local lines="${2:-500}"
+    
+    if ! tmux has-session -t "$session_name" 2>/dev/null; then
+        echo '{"error": "session_not_found", "session": "'"$session_name"'"}'
+        return 1
+    fi
+    
+    local output
+    output=$(tmux capture-pane -t "$session_name" -p -S -"$lines" 2>/dev/null || echo "")
+    
+    jq -n --arg session "$session_name" --arg output "$output" \
+        '{session: $session, output: $output}'
+}
+
+# Kill a session
+cmd_kill() {
+    local session_name="$1"
+    
+    if tmux kill-session -t "$session_name" 2>/dev/null; then
+        echo '{"action": "killed", "session": "'"$session_name"'"}'
+    else
+        echo '{"error": "session_not_found", "session": "'"$session_name"'"}'
+        return 1
+    fi
+}
+
+# Main
+main() {
+    local cmd="${1:-list}"
+    local format="json"
+    
+    # Parse global flags
+    for arg in "$@"; do
+        case "$arg" in
+            --plain) format="plain" ;;
+            --json) format="json" ;;
+            -h|--help) show_help; exit 0 ;;
+        esac
+    done
+    
+    require_deps
+    
+    case "$cmd" in
+        list)
+            cmd_list "$format"
+            ;;
+        status)
+            cmd_status "$format"
+            ;;
+        run)
+            shift
+            cmd_run "$@"
+            ;;
+        wait)
+            shift
+            cmd_wait "$@"
+            ;;
+        output)
+            shift
+            # Parse options
+            local session="" lines=500
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --lines) lines="$2"; shift 2 ;;
+                    --*) shift ;;
+                    *) session="$1"; shift ;;
+                esac
+            done
+            cmd_output "$session" "$lines"
+            ;;
+        kill)
+            shift
+            cmd_kill "$1"
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        *)
+            echo "Unknown command: $cmd" >&2
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -8,32 +8,70 @@ Central location for reusable CLI tools and documentation.
 tools/
 ├── cli-over-mcp.md       # Pattern: replacing MCP with CLI scripts
 ├── render-config.md      # Render CLI setup docs
+├── browser/              # Browser debugging via Chrome DevTools Protocol
 ├── render/               # Render CLI scripts (reference copy)
 ├── cloudflare/           # Cloudflare CLI scripts (reference copy)
 ├── github/               # GitHub Actions CLI scripts
 ├── infisical/            # Infisical API scripts
 ├── salesforce/           # Salesforce SOQL query scripts
-└── linear/               # Linear issue tracking CLI
+├── linear/               # Linear issue tracking CLI
+└── tmux/                 # Tmux session monitoring for AI agents
 ```
 
 ## Installed Locations
 
 | Component | Location |
 |-----------|----------|
+| Browser scripts | `~/.local/bin/browser-*` |
+| Browser config | No config needed (uses Chrome profile) |
 | Render scripts | `~/.local/bin/render-*` |
 | Render config | `~/.config/render/` |
 | Cloudflare scripts | `~/.local/bin/cf-*` |
 | Cloudflare config | `~/.config/cloudflare/` |
-| GitHub scripts | `~/.local/bin/gh-actions` |
+| GitHub scripts | `~/.local/bin/gh-actions`, `~/.local/bin/pr-ship` |
 | GitHub config | Uses `gh` CLI auth |
+| Infisical API | `~/.local/bin/infisical-api` |
+| Infisical config | `~/.config/infisical/` or `.env` |
 | Salesforce scripts | `~/.local/bin/sf-query` |
 | Salesforce config | Uses `sf` CLI auth |
 | Linear scripts | `~/.local/bin/linear-cli` |
 | Linear config | `~/.config/linear/api-key` |
 | iMessage | `~/.local/bin/imsg` (via go install) |
+| tmux-monitor | `~/.local/bin/tmux-monitor` |
+| tmux-monitor deps | tmux, tmuxwatch, jq |
 | Docs | This folder |
 
 ## Quick Reference
+
+### Browser Control (Playwright + CDP)
+
+```bash
+# Launch Chrome with debugging enabled
+browser-open                              # Opens localhost:5173
+browser-open http://localhost:3000        # Custom URL
+browser-open --force                      # Restart Chrome with debugging
+
+# Full browser control
+browser-ctl screenshot                    # Screenshot current page
+browser-ctl screenshot --full             # Full page screenshot
+browser-ctl screenshot ".element"         # Screenshot element
+browser-ctl logs                          # Stream console logs
+browser-ctl logs --level error            # Only errors
+browser-ctl click "button.submit"         # Click element
+browser-ctl type "#input" "hello"         # Type into input
+browser-ctl goto /accounts                # Navigate (relative URL)
+browser-ctl eval "document.title"         # Run JavaScript
+browser-ctl html ".content"               # Get element HTML
+browser-ctl snapshot                      # Accessibility tree (JSON)
+browser-ctl wait ".loaded"                # Wait for element
+browser-ctl tabs                          # List open tabs
+browser-ctl tab 1                         # Switch to tab
+browser-ctl url                           # Print current URL
+browser-ctl title                         # Print page title
+browser-ctl reload                        # Reload page
+```
+
+Screenshots saved to `/tmp/browser-ctl/`. Uses `~/.cursor-chrome-profile` (preserves auth).
 
 ### GitHub Actions CLI
 
@@ -59,6 +97,29 @@ pr-ship --wait 600         # Wait up to 10 min for checks
 ```
 
 Workflow: Creates PR with `--fill`, polls for CI green, rebases & merges, then runs `finish-pr`.
+
+### Infisical API CLI
+
+For managing secrets and syncs via the Infisical API:
+
+```bash
+# Setup (one-time)
+infisical-api setup
+
+# List projects and secrets
+infisical-api projects list
+infisical-api secrets list -p <project-id> -e staging
+infisical-api secrets export -p <project-id> -e production
+
+# Render syncs
+infisical-api syncs list <project-id>
+infisical-api syncs force <sync-id>              # Force sync via temp secret
+
+# Raw API access
+infisical-api api /v1/some/endpoint
+```
+
+**Note:** Use canonical environment names: `staging` and `production`. If your Infisical project uses different slugs (e.g., `prod`), update them in the Infisical dashboard for consistency.
 
 ### Render CLI
 
@@ -117,6 +178,44 @@ imsg send --to "+14155551212" --text "Hello!"  # Send a message
 ```
 
 Requires Full Disk Access for terminal. From [github.com/steipete/imsg](https://github.com/steipete/imsg)
+
+### Tmux Monitor (AI Agent Process Monitoring)
+
+Monitor long-running processes in tmux sessions. Designed for AI agents that need to:
+- Run tests/builds and wait for completion
+- Check if background processes have failed
+- Get structured JSON output about process state
+
+```bash
+# Quick status check - are any processes running/failed?
+tmux-monitor status
+
+# List all sessions with recent output
+tmux-monitor list
+
+# Run a command and wait for completion (blocking)
+tmux-monitor run my-tests "npm test" --wait --timeout 300
+
+# Start a long-running process (non-blocking)
+tmux-monitor run dev-server "npm run dev"
+
+# Wait for a specific session to complete
+tmux-monitor wait my-tests --timeout 60
+
+# Get full output from a session
+tmux-monitor output dev-server --lines 200
+
+# Kill a session
+tmux-monitor kill dev-server
+```
+
+All commands output JSON by default. Add `--plain` for human-readable output.
+
+**Status values:** `running`, `completed` (exit 0), `failed` (exit non-zero)
+
+**Dependencies:** `brew install tmux steipete/tap/tmuxwatch jq`
+
+From [github.com/steipete/tmuxwatch](https://github.com/steipete/tmuxwatch)
 
 ### Per-Project Override
 

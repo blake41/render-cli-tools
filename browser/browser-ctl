@@ -1,0 +1,603 @@
+#!/usr/bin/env node
+/**
+ * browser-ctl - Control browser via Playwright + CDP
+ * 
+ * Connects to Chrome with remote debugging and provides full control:
+ * - Screenshots
+ * - Console logs
+ * - Click, type, navigate
+ * - JavaScript evaluation
+ * - Accessibility snapshots
+ * 
+ * Usage:
+ *   browser-ctl screenshot                    # Screenshot current page
+ *   browser-ctl logs                          # Stream console logs
+ *   browser-ctl click "button.submit"         # Click element
+ *   browser-ctl goto "/accounts"              # Navigate
+ *   browser-ctl eval "document.title"         # Run JS
+ */
+
+const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+
+// Config
+const CDP_PORT = process.env.CDP_PORT || 9222;
+const CDP_HOST = process.env.CDP_HOST || 'localhost';
+const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR || '/tmp/browser-ctl';
+
+// ANSI colors
+const c = {
+  reset: '\x1b[0m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  cyan: '\x1b[36m',
+  gray: '\x1b[90m',
+};
+
+// Ensure screenshot directory exists
+if (!fs.existsSync(SCREENSHOT_DIR)) {
+  fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+}
+
+async function connect() {
+  try {
+    const browser = await chromium.connectOverCDP(`http://${CDP_HOST}:${CDP_PORT}`);
+    const contexts = browser.contexts();
+    if (contexts.length === 0) {
+      console.error(`${c.red}No browser contexts found${c.reset}`);
+      process.exit(1);
+    }
+    const pages = contexts[0].pages();
+    if (pages.length === 0) {
+      console.error(`${c.red}No pages found${c.reset}`);
+      process.exit(1);
+    }
+    return { browser, page: pages[0], contexts };
+  } catch (err) {
+    if (err.message.includes('ECONNREFUSED')) {
+      console.error(`${c.red}Cannot connect to Chrome on ${CDP_HOST}:${CDP_PORT}${c.reset}`);
+      console.error(`\nStart Chrome with: ${c.cyan}browser-open${c.reset}`);
+    } else {
+      console.error(`${c.red}Connection error: ${err.message}${c.reset}`);
+    }
+    process.exit(1);
+  }
+}
+
+// Commands
+
+async function cmdScreenshot(args) {
+  const { page, browser } = await connect();
+  
+  let selector = null;
+  let fullPage = false;
+  let filename = null;
+  
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--full' || args[i] === '-f') {
+      fullPage = true;
+    } else if (args[i] === '--selector' || args[i] === '-s') {
+      selector = args[++i];
+    } else if (args[i] === '--output' || args[i] === '-o') {
+      filename = args[++i];
+    } else if (!args[i].startsWith('-')) {
+      selector = args[i];
+    }
+  }
+  
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+  filename = filename || path.join(SCREENSHOT_DIR, `screenshot-${timestamp}.png`);
+  
+  try {
+    if (selector) {
+      const element = await page.$(selector);
+      if (!element) {
+        console.error(`${c.red}Element not found: ${selector}${c.reset}`);
+        await browser.close();
+        process.exit(1);
+      }
+      await element.screenshot({ path: filename });
+    } else {
+      await page.screenshot({ path: filename, fullPage });
+    }
+    
+    console.log(`${c.green}Screenshot saved:${c.reset} ${filename}`);
+    
+    // Also output the path for easy parsing
+    console.log(`${c.dim}Page: ${page.url()}${c.reset}`);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdLogs(args) {
+  const { page, browser, contexts } = await connect();
+  
+  let level = null;
+  let json = false;
+  let clear = false;
+  
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--level' || args[i] === '-l') {
+      level = args[++i];
+    } else if (args[i] === '--json' || args[i] === '-j') {
+      json = true;
+    } else if (args[i] === '--clear' || args[i] === '-c') {
+      clear = true;
+    }
+  }
+  
+  const levels = ['debug', 'log', 'info', 'warn', 'error'];
+  const minLevel = level ? levels.indexOf(level) : 0;
+  
+  function shouldShow(msgLevel) {
+    const idx = levels.indexOf(msgLevel);
+    return idx >= minLevel;
+  }
+  
+  function formatLevel(lvl) {
+    const colors = { error: c.red, warn: c.yellow, info: c.blue, debug: c.gray, log: c.reset };
+    return (colors[lvl] || c.reset) + lvl.toUpperCase().padEnd(5) + c.reset;
+  }
+  
+  function timestamp() {
+    return c.dim + new Date().toISOString().split('T')[1].slice(0, 12) + c.reset;
+  }
+
+  // Listen on all pages
+  const allPages = contexts.flatMap(ctx => ctx.pages());
+  
+  for (const p of allPages) {
+    p.on('console', msg => {
+      const type = msg.type() === 'warning' ? 'warn' : msg.type();
+      if (!shouldShow(type)) return;
+      
+      const text = msg.text();
+      const location = msg.location();
+      const loc = location.url ? ` ${c.dim}(${path.basename(location.url)}:${location.lineNumber})${c.reset}` : '';
+      
+      if (json) {
+        console.log(JSON.stringify({ level: type, message: text, url: location.url, line: location.lineNumber, timestamp: new Date().toISOString() }));
+      } else {
+        console.log(`${timestamp()} ${formatLevel(type)} ${text}${loc}`);
+      }
+    });
+    
+    p.on('pageerror', err => {
+      if (!shouldShow('error')) return;
+      if (json) {
+        console.log(JSON.stringify({ level: 'error', message: err.message, stack: err.stack, timestamp: new Date().toISOString() }));
+      } else {
+        console.log(`${timestamp()} ${c.red}ERROR${c.reset} ${c.red}[EXCEPTION]${c.reset} ${err.message}`);
+      }
+    });
+
+    p.on('requestfailed', req => {
+      if (!shouldShow('error')) return;
+      const failure = req.failure();
+      if (failure?.errorText === 'net::ERR_ABORTED') return;
+      if (json) {
+        console.log(JSON.stringify({ level: 'error', message: `Network: ${failure?.errorText}`, url: req.url(), timestamp: new Date().toISOString() }));
+      } else {
+        console.log(`${timestamp()} ${c.red}ERROR${c.reset} ${c.red}[NETWORK]${c.reset} ${failure?.errorText} - ${req.url()}`);
+      }
+    });
+  }
+  
+  // Listen for new pages
+  for (const ctx of contexts) {
+    ctx.on('page', newPage => {
+      if (!json) console.log(`${c.cyan}● New tab opened${c.reset}`);
+      // Attach same listeners...
+      newPage.on('console', msg => {
+        const type = msg.type() === 'warning' ? 'warn' : msg.type();
+        if (!shouldShow(type)) return;
+        const text = msg.text();
+        if (json) {
+          console.log(JSON.stringify({ level: type, message: text, timestamp: new Date().toISOString() }));
+        } else {
+          console.log(`${timestamp()} ${formatLevel(type)} ${text}`);
+        }
+      });
+    });
+  }
+  
+  if (!json) {
+    console.log(`${c.cyan}● Connected to Chrome${c.reset} (${allPages.length} page${allPages.length > 1 ? 's' : ''})`);
+    console.log(`${c.dim}  Press Ctrl+C to stop${c.reset}\n`);
+  }
+  
+  // Keep alive
+  process.on('SIGINT', async () => {
+    if (!json) console.log(`\n${c.dim}Disconnecting...${c.reset}`);
+    await browser.close();
+    process.exit(0);
+  });
+  
+  // Keep process running
+  await new Promise(() => {});
+}
+
+async function cmdClick(args) {
+  const { page, browser } = await connect();
+  
+  const selector = args[0];
+  if (!selector) {
+    console.error(`${c.red}Usage: browser-ctl click <selector>${c.reset}`);
+    await browser.close();
+    process.exit(1);
+  }
+  
+  try {
+    await page.click(selector, { timeout: 5000 });
+    console.log(`${c.green}Clicked:${c.reset} ${selector}`);
+  } catch (err) {
+    console.error(`${c.red}Click failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdType(args) {
+  const { page, browser } = await connect();
+  
+  const selector = args[0];
+  const text = args.slice(1).join(' ');
+  
+  if (!selector || !text) {
+    console.error(`${c.red}Usage: browser-ctl type <selector> <text>${c.reset}`);
+    await browser.close();
+    process.exit(1);
+  }
+  
+  try {
+    await page.fill(selector, text, { timeout: 5000 });
+    console.log(`${c.green}Typed into ${selector}:${c.reset} "${text}"`);
+  } catch (err) {
+    console.error(`${c.red}Type failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdGoto(args) {
+  const { page, browser } = await connect();
+  
+  let url = args[0];
+  if (!url) {
+    console.error(`${c.red}Usage: browser-ctl goto <url>${c.reset}`);
+    await browser.close();
+    process.exit(1);
+  }
+  
+  // Handle relative URLs
+  if (url.startsWith('/')) {
+    const currentUrl = new URL(page.url());
+    url = `${currentUrl.origin}${url}`;
+  }
+  
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    console.log(`${c.green}Navigated to:${c.reset} ${page.url()}`);
+  } catch (err) {
+    console.error(`${c.red}Navigation failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdEval(args) {
+  const { page, browser } = await connect();
+  
+  const script = args.join(' ');
+  if (!script) {
+    console.error(`${c.red}Usage: browser-ctl eval <javascript>${c.reset}`);
+    await browser.close();
+    process.exit(1);
+  }
+  
+  try {
+    const result = await page.evaluate(script);
+    if (typeof result === 'object') {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(result);
+    }
+  } catch (err) {
+    console.error(`${c.red}Eval failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdHtml(args) {
+  const { page, browser } = await connect();
+  
+  const selector = args[0];
+  
+  try {
+    let html;
+    if (selector) {
+      const element = await page.$(selector);
+      if (!element) {
+        console.error(`${c.red}Element not found: ${selector}${c.reset}`);
+        await browser.close();
+        process.exit(1);
+      }
+      html = await element.innerHTML();
+    } else {
+      html = await page.content();
+    }
+    console.log(html);
+  } catch (err) {
+    console.error(`${c.red}HTML fetch failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdSnapshot(args) {
+  const { page, browser } = await connect();
+  
+  try {
+    // Get accessibility tree - similar to Cursor's browser_snapshot
+    const snapshot = await page.accessibility.snapshot({ interestingOnly: true });
+    console.log(JSON.stringify(snapshot, null, 2));
+  } catch (err) {
+    console.error(`${c.red}Snapshot failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdUrl(args) {
+  const { page, browser } = await connect();
+  console.log(page.url());
+  await browser.close();
+}
+
+async function cmdTitle(args) {
+  const { page, browser } = await connect();
+  console.log(await page.title());
+  await browser.close();
+}
+
+async function cmdWait(args) {
+  const { page, browser } = await connect();
+  
+  const target = args[0];
+  const timeout = parseInt(args[1]) || 30000;
+  
+  if (!target) {
+    console.error(`${c.red}Usage: browser-ctl wait <selector|url:pattern|text:content> [timeout_ms]${c.reset}`);
+    await browser.close();
+    process.exit(1);
+  }
+  
+  try {
+    if (target.startsWith('url:')) {
+      const pattern = target.slice(4);
+      await page.waitForURL(`**${pattern}**`, { timeout });
+    } else if (target.startsWith('text:')) {
+      const text = target.slice(5);
+      await page.waitForSelector(`text=${text}`, { timeout });
+    } else {
+      await page.waitForSelector(target, { timeout });
+    }
+    console.log(`${c.green}Wait complete:${c.reset} ${target}`);
+  } catch (err) {
+    console.error(`${c.red}Wait failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdReload(args) {
+  const { page, browser } = await connect();
+  
+  try {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    console.log(`${c.green}Reloaded:${c.reset} ${page.url()}`);
+  } catch (err) {
+    console.error(`${c.red}Reload failed: ${err.message}${c.reset}`);
+    process.exit(1);
+  } finally {
+    await browser.close();
+  }
+}
+
+async function cmdTabs(args) {
+  const { browser, contexts } = await connect();
+  
+  const allPages = contexts.flatMap(ctx => ctx.pages());
+  console.log(`${c.cyan}Open tabs (${allPages.length}):${c.reset}`);
+  for (let i = 0; i < allPages.length; i++) {
+    const p = allPages[i];
+    const title = await p.title();
+    console.log(`  ${i}: ${title || '(no title)'}`);
+    console.log(`     ${c.dim}${p.url()}${c.reset}`);
+  }
+  
+  await browser.close();
+}
+
+async function cmdTab(args) {
+  const { browser, contexts } = await connect();
+  
+  const index = parseInt(args[0]);
+  if (isNaN(index)) {
+    console.error(`${c.red}Usage: browser-ctl tab <index>${c.reset}`);
+    console.error(`Use 'browser-ctl tabs' to see available tabs`);
+    await browser.close();
+    process.exit(1);
+  }
+  
+  const allPages = contexts.flatMap(ctx => ctx.pages());
+  if (index < 0 || index >= allPages.length) {
+    console.error(`${c.red}Invalid tab index: ${index}${c.reset}`);
+    await browser.close();
+    process.exit(1);
+  }
+  
+  const targetPage = allPages[index];
+  await targetPage.bringToFront();
+  console.log(`${c.green}Switched to tab ${index}:${c.reset} ${await targetPage.title()}`);
+  
+  await browser.close();
+}
+
+// Help
+function showHelp() {
+  console.log(`
+${c.cyan}browser-ctl${c.reset} - Control browser via Playwright + CDP
+
+${c.yellow}USAGE${c.reset}
+  browser-ctl <command> [options]
+
+${c.yellow}COMMANDS${c.reset}
+  ${c.green}screenshot${c.reset} [selector] [--full] [-o file]
+      Take screenshot of page or element
+      
+  ${c.green}logs${c.reset} [--level LEVEL] [--json]
+      Stream console logs (levels: debug, log, info, warn, error)
+      
+  ${c.green}click${c.reset} <selector>
+      Click an element
+      
+  ${c.green}type${c.reset} <selector> <text>
+      Type text into an input
+      
+  ${c.green}goto${c.reset} <url>
+      Navigate to URL (supports relative paths like /accounts)
+      
+  ${c.green}eval${c.reset} <javascript>
+      Execute JavaScript and print result
+      
+  ${c.green}html${c.reset} [selector]
+      Get HTML content of page or element
+      
+  ${c.green}snapshot${c.reset}
+      Get accessibility tree (like Cursor's browser_snapshot)
+      
+  ${c.green}url${c.reset}
+      Print current URL
+      
+  ${c.green}title${c.reset}
+      Print page title
+      
+  ${c.green}wait${c.reset} <selector|url:pattern|text:content> [timeout]
+      Wait for element, URL, or text
+      
+  ${c.green}reload${c.reset}
+      Reload current page
+      
+  ${c.green}tabs${c.reset}
+      List all open tabs
+      
+  ${c.green}tab${c.reset} <index>
+      Switch to tab by index
+
+${c.yellow}EXAMPLES${c.reset}
+  browser-ctl screenshot --full
+  browser-ctl logs --level warn
+  browser-ctl click "button[type=submit]"
+  browser-ctl type "#search" "hello world"
+  browser-ctl goto /accounts
+  browser-ctl eval "document.querySelectorAll('button').length"
+  browser-ctl wait "text:Loading" 10000
+  browser-ctl html ".sidebar"
+
+${c.yellow}ENVIRONMENT${c.reset}
+  CDP_PORT         Chrome debugging port (default: 9222)
+  CDP_HOST         Chrome host (default: localhost)
+  SCREENSHOT_DIR   Screenshot output directory (default: /tmp/browser-ctl)
+
+${c.yellow}SETUP${c.reset}
+  First, launch Chrome with debugging enabled:
+    ${c.cyan}browser-open${c.reset}
+  
+  Then use browser-ctl commands to interact with it.
+`);
+}
+
+// Main
+async function main() {
+  const args = process.argv.slice(2);
+  const command = args[0];
+  const cmdArgs = args.slice(1);
+  
+  if (!command || command === '--help' || command === '-h') {
+    showHelp();
+    process.exit(0);
+  }
+  
+  switch (command) {
+    case 'screenshot':
+    case 'ss':
+      await cmdScreenshot(cmdArgs);
+      break;
+    case 'logs':
+    case 'log':
+      await cmdLogs(cmdArgs);
+      break;
+    case 'click':
+      await cmdClick(cmdArgs);
+      break;
+    case 'type':
+      await cmdType(cmdArgs);
+      break;
+    case 'goto':
+    case 'go':
+      await cmdGoto(cmdArgs);
+      break;
+    case 'eval':
+    case 'js':
+      await cmdEval(cmdArgs);
+      break;
+    case 'html':
+      await cmdHtml(cmdArgs);
+      break;
+    case 'snapshot':
+    case 'snap':
+      await cmdSnapshot(cmdArgs);
+      break;
+    case 'url':
+      await cmdUrl(cmdArgs);
+      break;
+    case 'title':
+      await cmdTitle(cmdArgs);
+      break;
+    case 'wait':
+      await cmdWait(cmdArgs);
+      break;
+    case 'reload':
+      await cmdReload(cmdArgs);
+      break;
+    case 'tabs':
+      await cmdTabs(cmdArgs);
+      break;
+    case 'tab':
+      await cmdTab(cmdArgs);
+      break;
+    default:
+      console.error(`${c.red}Unknown command: ${command}${c.reset}`);
+      console.error(`Run 'browser-ctl --help' for usage`);
+      process.exit(1);
+  }
+}
+
+main().catch(err => {
+  console.error(`${c.red}Error: ${err.message}${c.reset}`);
+  process.exit(1);
+});

@@ -72,6 +72,16 @@ fi
 if [[ "$CREATE_PR" == "true" ]]; then
   info "Creating PR for branch: $BRANCH"
   
+  # Check if branch is pushed to remote
+  if ! git ls-remote --exit-code --heads origin "$BRANCH" &>/dev/null; then
+    warn "Branch not pushed to remote. Pushing now..."
+    if ! git push -u origin "$BRANCH"; then
+      error "Failed to push branch to remote"
+      exit 1
+    fi
+    success "Pushed $BRANCH to origin"
+  fi
+  
   # Check if PR already exists
   EXISTING_PR=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
   if [[ -n "$EXISTING_PR" ]]; then
@@ -79,8 +89,17 @@ if [[ "$CREATE_PR" == "true" ]]; then
     PR_NUMBER="$EXISTING_PR"
   else
     # Create PR with defaults
-    PR_URL=$(gh pr create --fill 2>&1)
+    if ! PR_URL=$(gh pr create --fill 2>&1); then
+      error "Failed to create PR:"
+      echo "$PR_URL"
+      exit 1
+    fi
     PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$' || gh pr view --json number --jq '.number')
+    if [[ -z "$PR_NUMBER" ]]; then
+      error "Could not determine PR number. gh output was:"
+      echo "$PR_URL"
+      exit 1
+    fi
     success "Created PR #$PR_NUMBER"
   fi
 else
