@@ -14,7 +14,6 @@ set -euo pipefail
 PORT=9222
 PROFILE="/Users/blake/.cursor-chrome-profile"
 URL="http://localhost:5173"
-FORCE=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -28,7 +27,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --force|-f)
-            FORCE=true
+            # Deprecated: no longer needed, kept for backwards compatibility
             shift
             ;;
         --help|-h)
@@ -41,21 +40,17 @@ USAGE
 OPTIONS
   --port, -p N     Debugging port (default: 9222)
   --profile PATH   Chrome profile directory
-  --force, -f      Quit Chrome and restart with debugging
   --help, -h       Show this help
 
 EXAMPLES
   browser-open                           # Open localhost:5173
   browser-open http://localhost:3000     # Open specific URL
   browser-open --port 9223 http://...    # Custom port
-  browser-open --force                   # Restart Chrome with debugging
 
 NOTES
   Uses ~/.cursor-chrome-profile by default (preserves auth sessions)
   Automatically starts log collector - view logs with 'browser-ctl logs'
-  
-  IMPORTANT: If Chrome is already running, --remote-debugging-port is ignored.
-  Use --force to quit and restart Chrome, or quit Chrome manually first.
+  Launches a separate Chrome instance - your personal Chrome stays untouched.
 EOF
             exit 0
             ;;
@@ -94,38 +89,19 @@ start_collector() {
     fi
 }
 
-# Check if Chrome is already running
-if pgrep -q "Google Chrome"; then
-    # Check if debugging port is already active
-    if curl -s "http://localhost:$PORT/json/version" > /dev/null 2>&1; then
-        echo "✓ Chrome is already running with debugging on port $PORT"
-        echo "  Opening: $URL"
-        open -a "Google Chrome" "$URL"
-        start_collector
-        echo ""
-        echo "Logs: browser-ctl logs"
-        exit 0
-    fi
-    
-    if [[ "$FORCE" == "true" ]]; then
-        echo "Quitting Chrome to enable debugging..."
-        osascript -e 'tell application "Google Chrome" to quit' 2>/dev/null || true
-        sleep 2
-    else
-        echo "⚠️  Chrome is running WITHOUT remote debugging enabled."
-        echo ""
-        echo "Options:"
-        echo "  1. Run with --force to quit Chrome and restart with debugging:"
-        echo "     browser-open --force $URL"
-        echo ""
-        echo "  2. Quit Chrome manually (Cmd+Q), then run browser-open again"
-        echo ""
-        echo "  3. Use Chrome DevTools directly (no browser-logs integration)"
-        exit 1
-    fi
+# Check if debugging port is already active
+if curl -s "http://localhost:$PORT/json/version" > /dev/null 2>&1; then
+    echo "✓ Chrome debugging already active on port $PORT"
+    echo "  Opening: $URL"
+    # Use CDP to open URL in the automation Chrome (not personal Chrome)
+    curl -s "http://localhost:$PORT/json/new?$URL" > /dev/null
+    start_collector
+    echo ""
+    echo "Logs: browser-ctl logs"
+    exit 0
 fi
 
-echo "Opening Chrome with remote debugging on port $PORT..."
+echo "Launching automation Chrome (separate instance) on port $PORT..."
 echo "URL: $URL"
 echo ""
 
@@ -150,5 +126,5 @@ for i in {1..10}; do
 done
 
 echo ""
-echo "⚠️  Debugging port not responding. Chrome may have connected to an existing instance."
-echo "   Try: browser-open --force $URL"
+echo "⚠️  Debugging port not responding after 5 seconds."
+echo "   Check if another process is using port $PORT"
