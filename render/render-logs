@@ -8,6 +8,9 @@ LINES=20
 LOG_TYPE=""
 LOG_LEVEL=""
 SINCE=""
+START_TIME=""
+END_TIME=""
+DIRECTION=""
 
 # Parse arguments
 SERVICE_ID=""
@@ -29,19 +32,40 @@ while [[ $# -gt 0 ]]; do
             SINCE="$2"
             shift 2
             ;;
+        --start)
+            START_TIME="$2"
+            shift 2
+            ;;
+        --end)
+            END_TIME="$2"
+            shift 2
+            ;;
+        --direction)
+            DIRECTION="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: render-logs <service-id> [options]"
             echo ""
             echo "Options:"
-            echo "  --lines, -n N    Number of log lines (default: 20)"
-            echo "  --type TYPE      Filter by type: app, request, build"
-            echo "  --level LEVEL    Filter by level: error, warn, info"
-            echo "  --since TIME     Start time (RFC3339 or relative like '1h' or '30m')"
+            echo "  --lines, -n N      Number of log lines (default: 20)"
+            echo "  --type TYPE        Filter by type: app, request, build"
+            echo "  --level LEVEL      Filter by level: error, warn, info"
+            echo "  --since TIME       Get logs from TIME ago until now"
+            echo "                     Examples: 1h, 30m, 7d, 24h"
+            echo "  --start TIME       Start time (RFC3339) - where to begin reading"
+            echo "  --end TIME         End time (RFC3339) - where to stop reading"
+            echo "  --direction DIR    Direction: backward (default), forward"
+            echo ""
+            echo "Time parameters:"
+            echo "  --since 7d         Logs from last 7 days (uses forward direction)"
+            echo "  --start/--end      For precise time ranges (both RFC3339 format)"
             echo ""
             echo "Examples:"
-            echo "  render-logs srv-xxxxx"
-            echo "  render-logs srv-xxxxx --level error --lines 50"
-            echo "  render-logs srv-xxxxx --since 1h"
+            echo "  render-logs srv-xxxxx                        # Recent logs"
+            echo "  render-logs srv-xxxxx --since 1h             # Last hour"
+            echo "  render-logs srv-xxxxx --since 7d --lines 500 # Last 7 days"
+            echo "  render-logs srv-xxxxx --level error          # Only errors"
             exit 0
             ;;
         -*)
@@ -70,8 +94,58 @@ if [[ -z "$OWNER_ID" ]]; then
     exit 1
 fi
 
+# Convert relative time to RFC3339 helper
+parse_relative_time() {
+    local time_spec="$1"
+    local result=""
+    
+    if [[ "$time_spec" =~ ^[0-9]{4}- ]]; then
+        # Already RFC3339 format
+        echo "$time_spec"
+        return 0
+    elif [[ "$time_spec" =~ ^([0-9]+)d$ ]]; then
+        local days="${BASH_REMATCH[1]}"
+        result=$(date -u -v-"${days}d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+                 date -u -d "${days} days ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+    elif [[ "$time_spec" =~ ^([0-9]+)h$ ]]; then
+        local hours="${BASH_REMATCH[1]}"
+        result=$(date -u -v-"${hours}H" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+                 date -u -d "${hours} hours ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+    elif [[ "$time_spec" =~ ^([0-9]+)m$ ]]; then
+        local mins="${BASH_REMATCH[1]}"
+        result=$(date -u -v-"${mins}M" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+                 date -u -d "${mins} minutes ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+    fi
+    
+    if [[ -n "$result" ]]; then
+        echo "$result"
+        return 0
+    fi
+    return 1
+}
+
+# Handle --since: converts to startTime with forward direction
+if [[ -n "$SINCE" ]]; then
+    COMPUTED_START_TIME=$(parse_relative_time "$SINCE")
+    if [[ -z "$COMPUTED_START_TIME" ]]; then
+        echo "Could not parse time: $SINCE" >&2
+        echo "Use relative time like '1h', '30m', '7d' or RFC3339 format" >&2
+        exit 1
+    fi
+    START_TIME="$COMPUTED_START_TIME"
+    # Use forward direction to read from past toward present
+    if [[ -z "$DIRECTION" ]]; then
+        DIRECTION="forward"
+    fi
+fi
+
+# Default direction is backward if not set
+if [[ -z "$DIRECTION" ]]; then
+    DIRECTION="backward"
+fi
+
 # Build query params
-PARAMS="ownerId=$OWNER_ID&resource=$SERVICE_ID&limit=$LINES&direction=backward"
+PARAMS="ownerId=$OWNER_ID&resource=$SERVICE_ID&limit=$LINES&direction=$DIRECTION"
 
 if [[ -n "$LOG_TYPE" ]]; then
     PARAMS="$PARAMS&type=$LOG_TYPE"
@@ -81,19 +155,12 @@ if [[ -n "$LOG_LEVEL" ]]; then
     PARAMS="$PARAMS&level=$LOG_LEVEL"
 fi
 
-if [[ -n "$SINCE" ]]; then
-    # Convert relative time to RFC3339 if needed
-    if [[ "$SINCE" =~ ^[0-9]{4}- ]]; then
-        START_TIME="$SINCE"
-    else
-        START_TIME=$(date -u -v-"$SINCE" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
-        if [[ -z "$START_TIME" ]]; then
-            echo "Could not parse time: $SINCE" >&2
-            echo "Use RFC3339 format or relative time like '1h' or '30m'" >&2
-            exit 1
-        fi
-    fi
+if [[ -n "$START_TIME" ]]; then
     PARAMS="$PARAMS&startTime=$START_TIME"
+fi
+
+if [[ -n "$END_TIME" ]]; then
+    PARAMS="$PARAMS&endTime=$END_TIME"
 fi
 
 # Fetch and format logs

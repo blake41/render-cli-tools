@@ -20,6 +20,7 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
+const yaml = require('js-yaml');
 
 // Config
 const CDP_PORT = process.env.CDP_PORT || 9222;
@@ -516,6 +517,475 @@ async function cmdTab(args) {
   await browser.close();
 }
 
+// Test runner
+async function cmdTest(args) {
+  // Check for help flag first
+  if (args.includes('--help') || args.includes('-h') || args.length === 0) {
+    console.log(`
+${c.cyan}browser-ctl test${c.reset} - Run browser tests from YAML/JSON specs
+
+${c.yellow}USAGE${c.reset}
+  browser-ctl test <file.yaml|directory> [options]
+
+${c.yellow}OPTIONS${c.reset}
+  --verbose, -v     Show detailed step-by-step output
+  --json            Output results as JSON
+  --junit=FILE      Write JUnit XML report to FILE
+  --bail            Stop on first test failure
+  --filter=PATTERN  Only run tests with names matching PATTERN
+
+${c.yellow}EXAMPLES${c.reset}
+  browser-ctl test tests/browser/auth.yaml
+  browser-ctl test tests/browser/
+  browser-ctl test tests/ --verbose
+  browser-ctl test tests/ --junit=results.xml
+  browser-ctl test tests/ --filter="login"
+
+${c.yellow}TEST FILE FORMAT (YAML)${c.reset}
+  name: My Test Suite
+  setup:
+    - goto: "http://localhost:5173"
+    - wait: "[data-testid='app']"
+  
+  tests:
+    - name: Login works
+      steps:
+        - click: "[data-testid='login-button']"
+        - type:
+            selector: "#email"
+            text: "test@example.com"
+        - click: "[data-testid='submit']"
+        - wait: "[data-testid='dashboard']"
+      assertions:
+        - visible: "[data-testid='dashboard']"
+        - url-includes: "/dashboard"
+
+${c.yellow}AVAILABLE STEPS${c.reset}
+  goto: <url>                    Navigate to URL
+  click: <selector>              Click element
+  type: { selector, text }       Type into input
+  wait: <selector|number>        Wait for element or milliseconds
+  sleep: <ms>                    Wait for milliseconds
+  screenshot: [name]             Take screenshot
+  eval: <javascript>             Execute JavaScript
+  reload:                        Reload page
+
+${c.yellow}AVAILABLE ASSERTIONS${c.reset}
+  visible: <selector>            Element is visible
+  hidden: <selector>             Element is hidden
+  contains: { selector, text }   Element contains text
+  url: <exact-url>               URL equals exactly
+  url-includes: <substring>      URL contains substring
+  url-matches: <regex>           URL matches regex
+  count: { selector, equals|min|max }  Element count
+  attribute: { selector, name, equals|includes }  Attribute value
+`);
+    process.exit(0);
+  }
+  
+  // Parse arguments
+  let testPath = args.find(a => !a.startsWith('-'));
+  let verbose = args.includes('--verbose') || args.includes('-v');
+  let jsonOutput = args.includes('--json');
+  let junitOutput = args.find(a => a.startsWith('--junit='))?.split('=')[1];
+  let bail = args.includes('--bail');
+  let filter = args.find(a => a.startsWith('--filter='))?.split('=')[1];
+  
+  if (!testPath) {
+    console.error(`${c.red}Usage: browser-ctl test <file.yaml|directory> [options]${c.reset}`);
+    console.error(`Run 'browser-ctl test --help' for more information.`);
+    process.exit(1);
+  }
+  
+  // Collect test files
+  let testFiles = [];
+  const stat = fs.statSync(testPath);
+  if (stat.isDirectory()) {
+    const files = fs.readdirSync(testPath);
+    testFiles = files
+      .filter(f => f.endsWith('.yaml') || f.endsWith('.yml') || f.endsWith('.json'))
+      .map(f => path.join(testPath, f));
+  } else {
+    testFiles = [testPath];
+  }
+  
+  if (testFiles.length === 0) {
+    console.error(`${c.red}No test files found${c.reset}`);
+    process.exit(1);
+  }
+  
+  // Results accumulator
+  const allResults = {
+    suites: [],
+    totalTests: 0,
+    passed: 0,
+    failed: 0,
+    skipped: 0,
+    duration: 0
+  };
+  
+  const startTime = Date.now();
+  
+  // Connect once for all tests
+  const { browser, page } = await connect();
+  
+  for (const file of testFiles) {
+    const content = fs.readFileSync(file, 'utf8');
+    let suite;
+    
+    try {
+      suite = file.endsWith('.json') ? JSON.parse(content) : yaml.load(content);
+    } catch (err) {
+      console.error(`${c.red}Failed to parse ${file}: ${err.message}${c.reset}`);
+      continue;
+    }
+    
+    const suiteResult = await runTestSuite(page, suite, { verbose, bail, filter, file });
+    allResults.suites.push(suiteResult);
+    allResults.totalTests += suiteResult.tests.length;
+    allResults.passed += suiteResult.passed;
+    allResults.failed += suiteResult.failed;
+    allResults.skipped += suiteResult.skipped;
+    
+    if (bail && suiteResult.failed > 0) break;
+  }
+  
+  allResults.duration = Date.now() - startTime;
+  
+  await browser.close();
+  
+  // Output results
+  if (jsonOutput) {
+    console.log(JSON.stringify(allResults, null, 2));
+  } else if (junitOutput) {
+    const junit = generateJUnitXml(allResults);
+    fs.writeFileSync(junitOutput, junit);
+    console.log(`${c.green}JUnit report written to:${c.reset} ${junitOutput}`);
+    printSummary(allResults);
+  } else {
+    printSummary(allResults);
+  }
+  
+  process.exit(allResults.failed > 0 ? 1 : 0);
+}
+
+async function runTestSuite(page, suite, opts) {
+  const { verbose, bail, filter, file } = opts;
+  const suiteName = suite.name || path.basename(file, path.extname(file));
+  
+  if (!opts.jsonOutput) {
+    console.log(`\n${c.cyan}▶ ${suiteName}${c.reset}`);
+  }
+  
+  const result = {
+    name: suiteName,
+    file,
+    tests: [],
+    passed: 0,
+    failed: 0,
+    skipped: 0,
+    duration: 0
+  };
+  
+  const suiteStart = Date.now();
+  
+  // Run setup steps
+  if (suite.setup) {
+    try {
+      await runSteps(page, suite.setup, verbose);
+    } catch (err) {
+      console.error(`${c.red}  Setup failed: ${err.message}${c.reset}`);
+      result.failed = (suite.tests || []).length;
+      return result;
+    }
+  }
+  
+  // Run each test
+  for (const test of (suite.tests || [])) {
+    const testName = test.name || 'Unnamed test';
+    
+    // Apply filter
+    if (filter && !testName.toLowerCase().includes(filter.toLowerCase())) {
+      result.skipped++;
+      result.tests.push({ name: testName, status: 'skipped' });
+      continue;
+    }
+    
+    const testStart = Date.now();
+    const testResult = { name: testName, status: 'passed', duration: 0, error: null };
+    
+    try {
+      // Run test steps
+      if (test.steps) {
+        await runSteps(page, test.steps, verbose);
+      }
+      
+      // Run assertions
+      if (test.assertions) {
+        await runAssertions(page, test.assertions, verbose);
+      }
+      
+      testResult.status = 'passed';
+      result.passed++;
+      if (!opts.jsonOutput) {
+        console.log(`  ${c.green}✓${c.reset} ${testName}`);
+      }
+    } catch (err) {
+      testResult.status = 'failed';
+      testResult.error = err.message;
+      result.failed++;
+      if (!opts.jsonOutput) {
+        console.log(`  ${c.red}✗${c.reset} ${testName}`);
+        console.log(`    ${c.dim}${err.message}${c.reset}`);
+      }
+      
+      // Take failure screenshot
+      try {
+        const screenshotPath = path.join(SCREENSHOT_DIR, `failure-${Date.now()}.png`);
+        await page.screenshot({ path: screenshotPath });
+        testResult.screenshot = screenshotPath;
+        if (verbose) {
+          console.log(`    ${c.dim}Screenshot: ${screenshotPath}${c.reset}`);
+        }
+      } catch (e) {}
+      
+      if (bail) break;
+    }
+    
+    testResult.duration = Date.now() - testStart;
+    result.tests.push(testResult);
+  }
+  
+  result.duration = Date.now() - suiteStart;
+  return result;
+}
+
+async function runSteps(page, steps, verbose) {
+  for (const step of steps) {
+    // Each step is an object like { goto: "/path" } or { click: "selector" }
+    const [action, value] = Object.entries(step)[0];
+    
+    if (verbose) {
+      console.log(`    ${c.dim}→ ${action}: ${JSON.stringify(value)}${c.reset}`);
+    }
+    
+    switch (action) {
+      case 'goto':
+        let url = value;
+        if (url.startsWith('/')) {
+          const currentUrl = new URL(page.url());
+          url = `${currentUrl.origin}${url}`;
+        }
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        break;
+        
+      case 'click':
+        await page.click(value, { timeout: 10000 });
+        break;
+        
+      case 'type':
+        // { type: { selector: "#input", text: "hello" } }
+        await page.fill(value.selector, value.text, { timeout: 10000 });
+        break;
+        
+      case 'wait':
+        if (typeof value === 'number') {
+          await page.waitForTimeout(value);
+        } else if (value.startsWith('url:')) {
+          await page.waitForURL(`**${value.slice(4)}**`, { timeout: 30000 });
+        } else {
+          await page.waitForSelector(value, { timeout: 30000 });
+        }
+        break;
+        
+      case 'screenshot':
+        const screenshotPath = typeof value === 'string' 
+          ? path.join(SCREENSHOT_DIR, value + '.png')
+          : path.join(SCREENSHOT_DIR, `step-${Date.now()}.png`);
+        await page.screenshot({ path: screenshotPath });
+        if (verbose) console.log(`      ${c.dim}Saved: ${screenshotPath}${c.reset}`);
+        break;
+        
+      case 'eval':
+        await page.evaluate(value);
+        break;
+        
+      case 'reload':
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        break;
+        
+      case 'sleep':
+        await page.waitForTimeout(value);
+        break;
+        
+      default:
+        throw new Error(`Unknown step action: ${action}`);
+    }
+  }
+}
+
+async function runAssertions(page, assertions, verbose) {
+  for (const assertion of assertions) {
+    const [type, value] = Object.entries(assertion)[0];
+    
+    // Run the assertion first, then log on success
+    switch (type) {
+      case 'visible':
+        const visibleEl = await page.$(value);
+        if (!visibleEl) {
+          throw new Error(`Element not found: ${value}`);
+        }
+        const isVisible = await visibleEl.isVisible();
+        if (!isVisible) {
+          throw new Error(`Element not visible: ${value}`);
+        }
+        break;
+        
+      case 'hidden':
+        const hiddenEl = await page.$(value);
+        if (hiddenEl && await hiddenEl.isVisible()) {
+          throw new Error(`Element should be hidden: ${value}`);
+        }
+        break;
+        
+      case 'contains':
+        // { contains: { selector: "h1", text: "Hello" } }
+        const containsEl = await page.$(value.selector);
+        if (!containsEl) {
+          throw new Error(`Element not found: ${value.selector}`);
+        }
+        const text = await containsEl.textContent();
+        if (!text.includes(value.text)) {
+          throw new Error(`Element "${value.selector}" does not contain "${value.text}". Found: "${text.substring(0, 100)}"`);
+        }
+        break;
+        
+      case 'url':
+        const currentUrl = page.url();
+        if (currentUrl !== value) {
+          throw new Error(`URL mismatch. Expected: ${value}, Got: ${currentUrl}`);
+        }
+        break;
+        
+      case 'url-includes':
+        if (!page.url().includes(value)) {
+          throw new Error(`URL should include "${value}". Got: ${page.url()}`);
+        }
+        break;
+        
+      case 'url-matches':
+        if (!new RegExp(value).test(page.url())) {
+          throw new Error(`URL should match "${value}". Got: ${page.url()}`);
+        }
+        break;
+        
+      case 'count':
+        // { count: { selector: ".item", min: 1, max: 10 } } or { count: { selector: ".item", equals: 5 } }
+        const elements = await page.$$(value.selector);
+        const count = elements.length;
+        if (value.equals !== undefined && count !== value.equals) {
+          throw new Error(`Expected ${value.equals} elements for "${value.selector}", found ${count}`);
+        }
+        if (value.min !== undefined && count < value.min) {
+          throw new Error(`Expected at least ${value.min} elements for "${value.selector}", found ${count}`);
+        }
+        if (value.max !== undefined && count > value.max) {
+          throw new Error(`Expected at most ${value.max} elements for "${value.selector}", found ${count}`);
+        }
+        break;
+        
+      case 'attribute':
+        // { attribute: { selector: "input", name: "value", equals: "hello" } }
+        const attrEl = await page.$(value.selector);
+        if (!attrEl) {
+          throw new Error(`Element not found: ${value.selector}`);
+        }
+        const attrValue = await attrEl.getAttribute(value.name);
+        if (value.equals !== undefined && attrValue !== value.equals) {
+          throw new Error(`Attribute "${value.name}" of "${value.selector}" should be "${value.equals}", got "${attrValue}"`);
+        }
+        if (value.includes !== undefined && (!attrValue || !attrValue.includes(value.includes))) {
+          throw new Error(`Attribute "${value.name}" should include "${value.includes}", got "${attrValue}"`);
+        }
+        break;
+        
+      case 'no-errors':
+        // Check browser console for errors (would need log file access)
+        // For now, this is a placeholder
+        break;
+        
+      default:
+        throw new Error(`Unknown assertion type: ${type}`);
+    }
+    
+    // Log success after assertion passes
+    if (verbose) {
+      console.log(`    ${c.dim}✓ assert ${type}: ${JSON.stringify(value)}${c.reset}`);
+    }
+  }
+}
+
+function printSummary(results) {
+  console.log(`\n${c.cyan}═══════════════════════════════════════${c.reset}`);
+  console.log(`${c.cyan}Test Results${c.reset}`);
+  console.log(`${c.cyan}═══════════════════════════════════════${c.reset}`);
+  
+  for (const suite of results.suites) {
+    const icon = suite.failed > 0 ? c.red + '✗' : c.green + '✓';
+    console.log(`\n${icon}${c.reset} ${suite.name}`);
+    console.log(`  ${c.dim}${suite.passed} passed, ${suite.failed} failed, ${suite.skipped} skipped (${suite.duration}ms)${c.reset}`);
+  }
+  
+  console.log(`\n${c.cyan}───────────────────────────────────────${c.reset}`);
+  
+  const icon = results.failed > 0 ? c.red + '✗' : c.green + '✓';
+  console.log(`${icon} Total: ${results.passed} passed, ${results.failed} failed, ${results.skipped} skipped${c.reset}`);
+  console.log(`${c.dim}Duration: ${results.duration}ms${c.reset}`);
+  
+  if (results.failed > 0) {
+    console.log(`\n${c.red}Some tests failed!${c.reset}`);
+  } else {
+    console.log(`\n${c.green}All tests passed!${c.reset}`);
+  }
+}
+
+function generateJUnitXml(results) {
+  const lines = ['<?xml version="1.0" encoding="UTF-8"?>'];
+  lines.push(`<testsuites tests="${results.totalTests}" failures="${results.failed}" time="${results.duration / 1000}">`);
+  
+  for (const suite of results.suites) {
+    lines.push(`  <testsuite name="${escapeXml(suite.name)}" tests="${suite.tests.length}" failures="${suite.failed}" time="${suite.duration / 1000}">`);
+    
+    for (const test of suite.tests) {
+      if (test.status === 'passed') {
+        lines.push(`    <testcase name="${escapeXml(test.name)}" time="${test.duration / 1000}"/>`);
+      } else if (test.status === 'failed') {
+        lines.push(`    <testcase name="${escapeXml(test.name)}" time="${test.duration / 1000}">`);
+        lines.push(`      <failure message="${escapeXml(test.error || 'Unknown error')}">${escapeXml(test.error || '')}</failure>`);
+        lines.push(`    </testcase>`);
+      } else {
+        lines.push(`    <testcase name="${escapeXml(test.name)}" time="0">`);
+        lines.push(`      <skipped/>`);
+        lines.push(`    </testcase>`);
+      }
+    }
+    
+    lines.push(`  </testsuite>`);
+  }
+  
+  lines.push('</testsuites>');
+  return lines.join('\n');
+}
+
+function escapeXml(str) {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
 // Help
 function showHelp() {
   console.log(`
@@ -572,6 +1042,14 @@ ${c.yellow}COMMANDS${c.reset}
       
   ${c.green}tab${c.reset} <index>
       Switch to tab by index
+      
+  ${c.green}test${c.reset} <file.yaml|directory> [options]
+      Run browser tests from YAML/JSON specs
+      --verbose, -v     Show detailed step output
+      --json            Output results as JSON
+      --junit=FILE      Write JUnit XML report
+      --bail            Stop on first failure
+      --filter=PATTERN  Only run tests matching pattern
 
 ${c.yellow}EXAMPLES${c.reset}
   browser-ctl screenshot --full
@@ -585,6 +1063,10 @@ ${c.yellow}EXAMPLES${c.reset}
   browser-ctl eval "document.querySelectorAll('button').length"
   browser-ctl wait "text:Loading" 10000
   browser-ctl html ".sidebar"
+  browser-ctl test tests/browser/              # Run all tests in directory
+  browser-ctl test tests/browser/auth.yaml     # Run single test file
+  browser-ctl test tests/ --junit=results.xml  # Generate JUnit report
+  browser-ctl test tests/ --filter="login"     # Only run tests matching "login"
 
 ${c.yellow}ENVIRONMENT${c.reset}
   CDP_PORT         Chrome debugging port (default: 9222)
@@ -657,6 +1139,9 @@ async function main() {
       break;
     case 'tab':
       await cmdTab(cmdArgs);
+      break;
+    case 'test':
+      await cmdTest(cmdArgs);
       break;
     default:
       console.error(`${c.red}Unknown command: ${command}${c.reset}`);

@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "chrome-remote-interface": "^0.33.2",
+    "js-yaml": "^4.1.1",
     "playwright": "^1.49.0"
   }
 }
